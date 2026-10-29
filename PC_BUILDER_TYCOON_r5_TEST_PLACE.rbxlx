@@ -1,0 +1,3306 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <External>null</External>
+  <External>nil</External>
+  <Item class="Workspace" referent="RBX11DE1BA6E56B42B1">
+    <Properties>
+      <string name="Name">Workspace</string>
+    </Properties>
+  </Item>
+  <Item class="ReplicatedStorage" referent="RBX151F4F615F994FC9">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="RBX6FB0559B50DB474F">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="RBX0BE70C4D468B4E12">
+        <Properties>
+          <string name="Name">AssemblyRules</string>
+          <ProtectedString name="Source">-- AssemblyRules.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "AssemblyRules")
+-- PURE rule logic. No Roblox APIs. The SERVER runs these checks. Clients may run them for preview only.
+-- Rules return codes and parameters, never display text. Text is produced by Locale.lua (language-specific).
+-- validate* functions return true, or false plus { code = &lt;CODE_NAME&gt;, params = { ... } }.
+
+local AssemblyRules = {}
+
+local function fail(code, params)
+	return false, { code = code, params = params or {} }
+end
+
+local function listContains(list, value)
+	for _, item in ipairs(list) do
+		if item == value then
+			return true
+		end
+	end
+	return false
+end
+
+-- state: { caseId, slots = {slotId -&gt; instanceId}, instances = {instanceId -&gt; {componentId, slotId}}, screws = {} }
+function AssemblyRules.newState(caseId)
+	return { caseId = caseId, slots = {}, instances = {}, screws = {} }
+end
+
+local function installedComponent(state, catalog, slotId)
+	local instanceId = state.slots[slotId]
+	if instanceId == nil then
+		return nil
+	end
+	return catalog.Components[state.instances[instanceId].componentId]
+end
+
+function AssemblyRules.validateInstall(state, catalog, componentId, instanceId, slotId)
+	local comp = catalog.Components[componentId]
+	if comp == nil then
+		return fail("UNKNOWN_COMPONENT", { part = componentId })
+	end
+	local slot = catalog.Slots[slotId]
+	if slot == nil then
+		return fail("UNKNOWN_SLOT", { slot = slotId })
+	end
+	if state.instances[instanceId] ~= nil then
+		return fail("ALREADY_INSTALLED", { part = componentId })
+	end
+	if state.slots[slotId] ~= nil then
+		return fail("SLOT_OCCUPIED", { slot = slotId })
+	end
+	if not listContains(slot.accepts, comp.kind) then
+		return fail("WRONG_PART_FOR_SLOT", { part = componentId, slot = slotId, kind = slot.accepts[1] })
+	end
+	for _, requiredSlot in ipairs(slot.requires) do
+		if state.slots[requiredSlot] == nil then
+			return fail("PARENT_NOT_INSTALLED", { slot = requiredSlot })
+		end
+	end
+
+	if comp.kind == "Motherboard" then
+		local caseComp = catalog.Components[state.caseId]
+		if not listContains(caseComp.formFactors, comp.formFactor) then
+			return fail("FORMFACTOR_MISMATCH", {
+				part = componentId, formFactor = comp.formFactor, caseForm = table.concat(caseComp.formFactors, ", "),
+			})
+		end
+	end
+
+	-- Safe: the requires lists above guarantee the motherboard exists for these checks.
+	local board = installedComponent(state, catalog, "CASE_MB")
+	if comp.kind == "CPU" and comp.socket ~= board.cpuSocket then
+		return fail("SOCKET_MISMATCH", { part = componentId, socket = board.cpuSocket })
+	end
+	if comp.kind == "RAM" and comp.ramType ~= board.ramType then
+		return fail("RAM_TYPE_MISMATCH", { part = componentId, ramType = board.ramType })
+	end
+
+	if comp.kind == "Cable" then
+		if slot.cableType ~= comp.cableType then
+			return fail("CABLE_WRONG_PORT", { part = componentId, slot = slotId })
+		end
+		local psu = installedComponent(state, catalog, "CASE_PSU")
+		if not listContains(psu.cables, comp.cableType) then
+			return fail("PSU_CABLE_UNAVAILABLE", { cableType = comp.cableType })
+		end
+	end
+
+	return true
+end
+
+function AssemblyRules.applyInstall(state, componentId, instanceId, slotId)
+	state.instances[instanceId] = { componentId = componentId, slotId = slotId }
+	state.slots[slotId] = instanceId
+	state.screws[instanceId] = 0
+end
+
+function AssemblyRules.validateUninstall(state, catalog, instanceId)
+	local inst = state.instances[instanceId]
+	if inst == nil then
+		return fail("NOT_INSTALLED", {})
+	end
+	for otherSlot, otherInstanceId in pairs(state.slots) do
+		for _, requiredSlot in ipairs(catalog.Slots[otherSlot].requires) do
+			if requiredSlot == inst.slotId then
+				local other = state.instances[otherInstanceId].componentId
+				return fail("HAS_DEPENDENTS", { part = inst.componentId, other = other })
+			end
+		end
+	end
+	return true
+end
+
+-- V0.1 simplification: removing a part also removes its screws.
+function AssemblyRules.applyUninstall(state, instanceId)
+	local inst = state.instances[instanceId]
+	state.slots[inst.slotId] = nil
+	state.instances[instanceId] = nil
+	state.screws[instanceId] = nil
+end
+
+function AssemblyRules.validateTighten(state, catalog, instanceId)
+	local inst = state.instances[instanceId]
+	if inst == nil then
+		return fail("NOT_INSTALLED", {})
+	end
+	local comp = catalog.Components[inst.componentId]
+	if (state.screws[instanceId] or 0) &gt;= (comp.screwsRequired or 0) then
+		return fail("NO_SCREWS_NEEDED", { part = inst.componentId })
+	end
+	return true
+end
+
+function AssemblyRules.applyTighten(state, instanceId)
+	state.screws[instanceId] = (state.screws[instanceId] or 0) + 1
+end
+
+function AssemblyRules.requiredWatts(state, catalog)
+	local pm = catalog.PowerModel
+	local total = pm.HeadroomWatts
+	for _, inst in pairs(state.instances) do
+		local comp = catalog.Components[inst.componentId]
+		if comp.kind == "CPU" then
+			total = total + (comp.tdp or 0)
+		elseif comp.kind == "Motherboard" then
+			total = total + pm.MotherboardWatts
+		elseif comp.kind == "RAM" then
+			total = total + pm.RamWattsPerStick
+		elseif comp.kind == "Storage" then
+			total = total + pm.StorageWatts
+		end
+	end
+	return total
+end
+
+-- Boot test. Collects EVERY problem, so players see all of them at once.
+function AssemblyRules.evaluateBoot(state, catalog)
+	local diagnostics = {}
+	local function add(code, params)
+		table.insert(diagnostics, { code = code, params = params or {} })
+	end
+
+	local board = installedComponent(state, catalog, "CASE_MB")
+	local psu = installedComponent(state, catalog, "CASE_PSU")
+
+	if board == nil then
+		add("NO_MOTHERBOARD")
+	end
+	if psu == nil then
+		add("NO_PSU")
+	end
+
+	if board ~= nil then
+		if state.slots["MB_CPU"] == nil then
+			add("NO_CPU")
+		end
+		if state.slots["MB_RAM1"] == nil and state.slots["MB_RAM2"] == nil then
+			add("NO_RAM")
+		end
+		if state.slots["MB_M2"] == nil then
+			add("NO_STORAGE")
+		end
+		for _, port in ipairs(board.requiredPorts) do
+			if state.slots[port] == nil then
+				add("MISSING_CABLE", { slot = port })
+			end
+		end
+	end
+
+	for instanceId, inst in pairs(state.instances) do
+		local comp = catalog.Components[inst.componentId]
+		local need = comp.screwsRequired or 0
+		local have = state.screws[instanceId] or 0
+		if have &lt; need then
+			add("SCREWS_INCOMPLETE", { part = inst.componentId, have = have, need = need })
+		end
+	end
+
+	if board ~= nil and psu ~= nil then
+		local needed = AssemblyRules.requiredWatts(state, catalog)
+		if psu.watts &lt; needed then
+			add("PSU_INSUFFICIENT", { needW = needed, watts = psu.watts })
+		end
+	end
+
+	return { ok = (#diagnostics == 0), diagnostics = diagnostics }
+end
+
+-- Order check. The PC must boot first, then meet RAM and storage minimums.
+function AssemblyRules.evaluateOrder(state, catalog, order)
+	local boot = AssemblyRules.evaluateBoot(state, catalog)
+	if not boot.ok then
+		return false, boot.diagnostics
+	end
+
+	local ramGB = 0
+	for _, slotId in ipairs({ "MB_RAM1", "MB_RAM2" }) do
+		local comp = installedComponent(state, catalog, slotId)
+		if comp ~= nil then
+			ramGB = ramGB + (comp.capacityGB or 0)
+		end
+	end
+	local storage = installedComponent(state, catalog, "MB_M2")
+	local storageGB = 0
+	if storage ~= nil then
+		storageGB = storage.capacityGB or 0
+	end
+
+	local diagnostics = {}
+	if ramGB &lt; order.minRamGB then
+		table.insert(diagnostics, { code = "ORDER_RAM_TOO_LOW", params = { need = order.minRamGB, have = ramGB } })
+	end
+	if storageGB &lt; order.minStorageGB then
+		table.insert(diagnostics, { code = "ORDER_STORAGE_TOO_SMALL", params = { need = order.minStorageGB, have = storageGB } })
+	end
+	return #diagnostics == 0, diagnostics
+end
+
+return AssemblyRules
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX5EC76B9643784141">
+        <Properties>
+          <string name="Name">Catalog</string>
+          <ProtectedString name="Source">-- Catalog.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "Catalog")
+-- Pure data. Product names are real and used only for identification. They imply no sponsorship or affiliation.
+-- Specs were checked against public retailer and manufacturer pages. Sources: docs/COMPONENTS_AND_COMPATIBILITY.md.
+-- Game rules are SIMPLIFIED approximations. They are not vendor compatibility guarantees.
+-- Lua 5.1 subset: loads under standard Lua for tests.
+
+local Catalog = {}
+
+-- Install points. ownerSlot is the slot whose installed part carries this socket (nil = the case).
+Catalog.Slots = {
+	CASE_MB  = { accepts = { "Motherboard" }, requires = {} },
+	CASE_PSU = { accepts = { "PSU" }, requires = {} },
+	MB_CPU   = { accepts = { "CPU" }, requires = { "CASE_MB" }, ownerSlot = "CASE_MB" },
+	MB_RAM1  = { accepts = { "RAM" }, requires = { "CASE_MB" }, ownerSlot = "CASE_MB" },
+	MB_RAM2  = { accepts = { "RAM" }, requires = { "CASE_MB" }, ownerSlot = "CASE_MB" },
+	MB_M2    = { accepts = { "Storage" }, requires = { "CASE_MB" }, ownerSlot = "CASE_MB" },
+	MB_PWR24 = { accepts = { "Cable" }, requires = { "CASE_MB", "CASE_PSU" }, ownerSlot = "CASE_MB", cableType = "MB24" },
+	MB_CPU8  = { accepts = { "Cable" }, requires = { "CASE_MB", "CASE_PSU" }, ownerSlot = "CASE_MB", cableType = "CPU8" },
+}
+
+-- Game approximation for the boot power check. Not vendor guidance. Uses base TDP only.
+Catalog.PowerModel = {
+	HeadroomWatts = 50,
+	MotherboardWatts = 40,
+	RamWattsPerStick = 5,
+	StorageWatts = 5,
+}
+
+Catalog.Components = {
+	case_corsair_4000d = {
+		id = "case_corsair_4000d", name = "Corsair 4000D Airflow", kind = "Case",
+		formFactors = { "ATX", "MATX", "ITX" }, screwsRequired = 0,
+	},
+	psu_corsair_rm550 = {
+		id = "psu_corsair_rm550", name = "Corsair RM550", kind = "PSU",
+		watts = 550, cables = { "MB24", "CPU8" }, screwsRequired = 4,
+	},
+	mb_asus_b760m = {
+		id = "mb_asus_b760m", name = "ASUS PRIME B760M-A WIFI D4", kind = "Motherboard",
+		formFactor = "MATX", cpuSocket = "LGA1700", ramType = "DDR4",
+		requiredPorts = { "MB_PWR24", "MB_CPU8" }, screwsRequired = 6,
+	},
+	cpu_intel_i5_12400f = {
+		id = "cpu_intel_i5_12400f", name = "Intel Core i5-12400F", kind = "CPU",
+		socket = "LGA1700", tdp = 65, screwsRequired = 0,
+	},
+	cpu_amd_ryzen5_5600 = {
+		id = "cpu_amd_ryzen5_5600", name = "AMD Ryzen 5 5600", kind = "CPU",
+		socket = "AM4", tdp = 65, screwsRequired = 0,
+	},
+	ram_corsair_lpx_8_ddr4 = {
+		id = "ram_corsair_lpx_8_ddr4", name = "Corsair Vengeance LPX 8GB DDR4-3200", kind = "RAM",
+		ramType = "DDR4", capacityGB = 8, screwsRequired = 0,
+	},
+	ram_corsair_vengeance_8_ddr5 = {
+		id = "ram_corsair_vengeance_8_ddr5", name = "Corsair Vengeance 8GB DDR5-5200", kind = "RAM",
+		ramType = "DDR5", capacityGB = 8, screwsRequired = 0,
+	},
+	ssd_samsung_980_500 = {
+		id = "ssd_samsung_980_500", name = "Samsung 980 500GB NVMe M.2", kind = "Storage",
+		capacityGB = 500, screwsRequired = 0,
+	},
+	cable_rm550_mb24 = {
+		id = "cable_rm550_mb24", name = "RM550 modular 24-pin cable", kind = "Cable",
+		cableType = "MB24", screwsRequired = 0,
+	},
+	cable_rm550_cpu8 = {
+		id = "cable_rm550_cpu8", name = "RM550 modular 8-pin CPU cable", kind = "Cable",
+		cableType = "CPU8", screwsRequired = 0,
+	},
+}
+
+-- The starter PC. "kit" is the correct build. "extras" are real but WRONG parts, so players learn from mistakes.
+Catalog.StarterPC = {
+	caseId = "case_corsair_4000d",
+	orderId = "office_01",
+	kit = {
+		"psu_corsair_rm550", "mb_asus_b760m", "cpu_intel_i5_12400f", "ram_corsair_lpx_8_ddr4",
+		"ssd_samsung_980_500", "cable_rm550_mb24", "cable_rm550_cpu8",
+	},
+	extras = { "cpu_amd_ryzen5_5600", "ram_corsair_vengeance_8_ddr5" },
+}
+
+-- The single customer order. Payout is decided and paid on the server only. Amount is a placeholder.
+Catalog.Orders = {
+	office_01 = { id = "office_01", minRamGB = 8, minStorageGB = 250, payout = 250 },
+}
+
+return Catalog
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBXB6B3E201F58D4BDF">
+        <Properties>
+          <string name="Name">Config</string>
+          <ProtectedString name="Source">-- Config.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "Config")
+-- PURE: no Roblox types, so the test suite can load it. Values marked PLACEHOLDER are starting guesses.
+
+local Config = {}
+
+Config.Version = "0.1.4"
+Config.DefaultLanguage = "en"
+
+-- Reach and placement (the server enforces these; the client uses the snap values for preview)
+Config.MaxInteractDistance = 18        -- PLACEHOLDER studs. Raised from 14 to fit the workshop layout.
+Config.InstallReachStuds = 3           -- PLACEHOLDER studs: proposed pose to socket
+Config.SnapRadiusStuds = 2.5           -- PLACEHOLDER: preview magnet range
+Config.SnapAngleDegrees = 15           -- PLACEHOLDER: allowed misalignment for snap and install
+Config.BenchHalfExtents = { x = 20, y = 20, z = 20 }   -- PLACEHOLDER: parts stay inside this box around the origin
+Config.WorkshopSpacing = 80            -- PLACEHOLDER studs between per-player workshops
+Config.BinSpacing = 3                  -- used only by the legacy template path
+
+-- Drag and pickup timing (client). PLACEHOLDER values.
+Config.PlacementTimeoutSec = 3         -- how long a pending placement may wait for the server
+Config.ConfirmDistanceStuds = 0.15     -- the real part counts as arrived within this distance
+Config.DragThresholdPixels = 8         -- movement at or below this is a tap (select only)
+Config.PickupTimeoutSec = 2            -- no pickup answer in time: the local drag is cancelled
+
+-- Maximum requests per player per action per second (server)
+Config.RateLimit = {
+	PickUp = 5,
+	ProposePlacement = 6,
+	ReleaseHold = 10,
+	RequestUninstall = 4,
+	TightenScrew = 8,
+	RequestBoot = 2,
+}
+
+Config.RemoteFolderName = "AssemblyRemotes"
+Config.RemoteNames = {
+	"PickUp",
+	"ProposePlacement",
+	"ReleaseHold",
+	"RequestUninstall",
+	"TightenScrew",
+	"RequestBoot",
+	"Feedback",
+}
+
+return Config
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX846B537C59B34DF1">
+        <Properties>
+          <string name="Name">Decisions</string>
+          <ProtectedString name="Source">-- Decisions.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "Decisions")
+-- PURE. The one place where a placement is decided. The server uses it to decide, and the client uses it for the
+-- green/red preview. Both pass the same inputs in the same order, so the preview cannot promise what the server refuses.
+
+local AssemblyRules = require(script.Parent:WaitForChild("AssemblyRules"))
+local PlacementRules = require(script.Parent:WaitForChild("PlacementRules"))
+
+local Decisions = {}
+
+-- Install into a socket. Order: rules, bench bounds, socket present, reach, alignment.
+-- ctx: state, catalog, componentId, instanceId, slotId, proposed (pose), socket (pose or nil),
+--      player (point or nil), benchOrigin, benchHalf, maxReach, cfg = { installReach, cosLimit }.
+-- Returns ok, code, params.
+function Decisions.install(ctx)
+	local rulesOk, diag = AssemblyRules.validateInstall(ctx.state, ctx.catalog, ctx.componentId, ctx.instanceId, ctx.slotId)
+	if not rulesOk then
+		return false, diag.code, diag.params or {}
+	end
+	if not PlacementRules.inBounds(ctx.proposed.pos, ctx.benchOrigin, ctx.benchHalf) then
+		return false, "OUT_OF_BOUNDS", {}
+	end
+	if ctx.socket == nil then
+		return false, "NO_SOCKET", {}
+	end
+	if ctx.player == nil or not PlacementRules.inReach(ctx.player, ctx.socket.pos, ctx.maxReach) then
+		return false, "TOO_FAR", {}
+	end
+	local poseOk, poseCode = PlacementRules.checkInstallPose(ctx.proposed, ctx.socket, ctx.cfg)
+	if not poseOk then
+		return false, poseCode, {}
+	end
+	return true, nil, {}
+end
+
+-- Free placement on the bench. Order: reach and bench bounds, then the layout rules (height, table, case, other parts).
+-- ctx: player (point or nil), proposed (pose), benchOrigin, benchHalf, maxReach,
+--      layout = nil (a part without a size, legacy) or { candidate, others, caseBox, surfaceY, tableBox }.
+-- Returns ok, code, params.
+function Decisions.free(ctx)
+	if ctx.player == nil then
+		return false, "TOO_FAR", {}
+	end
+	local poseOk, poseCode = PlacementRules.checkFreePose(ctx.proposed, ctx.player, ctx.benchOrigin, ctx.benchHalf, ctx.maxReach)
+	if not poseOk then
+		return false, poseCode, {}
+	end
+	local L = ctx.layout
+	if L == nil then
+		return true, nil, {}
+	end
+	local layoutOk, layoutCode, layoutParams = PlacementRules.checkFreeLayout(L.candidate, L.others, L.caseBox, L.surfaceY, L.tableBox)
+	if not layoutOk then
+		return false, layoutCode, layoutParams or {}
+	end
+	return true, nil, {}
+end
+
+return Decisions
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX36D5696632AE4FF7">
+        <Properties>
+          <string name="Name">DragSequence</string>
+          <ProtectedString name="Source">-- DragSequence.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "DragSequence")
+-- PURE state machine for ONE drag. It fixes the ORDER of requests so that:
+--   * a drop is never sent before the server has acknowledged the pickup,
+--   * a short movement is a TAP (select only). A tap never installs anything,
+--   * exactly one terminal decision is made per drag,
+--   * an answer for a different part is ignored.
+-- It makes no network calls. The client executes the actions it returns.
+-- Lua 5.1 subset: loads under standard Lua for tests.
+
+local DragSequence = {}
+
+-- Phases: "picking" (PickUp sent, no answer yet), "holding" (acknowledged),
+--         "awaiting_eval" (the drop needs the client's geometry check), "done" (terminal).
+
+function DragSequence.new(instanceId, thresholdPx)
+	return { id = instanceId, threshold = thresholdPx, phase = "picking", dragged = false, released = false }
+end
+
+-- Distance is measured from the press point, in pixels. Movement after release does not count.
+function DragSequence.pointerMoved(seq, distancePx)
+	if seq.released or seq.phase == "done" then
+		return
+	end
+	if distancePx &gt; seq.threshold then
+		seq.dragged = true
+	end
+end
+
+local function decide(seq)
+	if not seq.dragged then
+		seq.phase = "done"
+		return { { type = "tap" } }
+	end
+	seq.phase = "awaiting_eval"
+	return { { type = "evaluate" } }
+end
+
+-- The server's answer to the pickup. Answers for other parts are ignored.
+function DragSequence.ack(seq, instanceId, ok)
+	if seq.phase ~= "picking" or instanceId ~= seq.id then
+		return {}
+	end
+	if not ok then
+		seq.phase = "done"
+		return { { type = "cancel" } }
+	end
+	seq.phase = "holding"
+	if seq.released then
+		return decide(seq)
+	end
+	return {}
+end
+
+-- Pointer released. Before the acknowledgement, the decision waits for it.
+function DragSequence.release(seq)
+	if seq.phase == "picking" then
+		seq.released = true
+		return {}
+	end
+	if seq.phase == "holding" then
+		seq.released = true
+		return decide(seq)
+	end
+	return {}
+end
+
+-- evaluation = { kind = "snap" | "free" | "invalid", slotId = ... } from the client's geometry check.
+function DragSequence.resolve(seq, evaluation)
+	if seq.phase ~= "awaiting_eval" then
+		return {}
+	end
+	seq.phase = "done"
+	if evaluation.kind == "snap" then
+		return { { type = "propose", slotId = evaluation.slotId } }
+	elseif evaluation.kind == "free" then
+		return { { type = "propose", slotId = "" } }
+	end
+	return { { type = "release" } }
+end
+
+-- No pickup answer in time: release defensively. Any late answer is ignored from now on.
+function DragSequence.timeout(seq)
+	if seq.phase ~= "picking" then
+		return {}
+	end
+	seq.phase = "done"
+	return { { type = "release" } }
+end
+
+return DragSequence
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX029542257BE045D8">
+        <Properties>
+          <string name="Name">Ledger</string>
+          <ProtectedString name="Source">-- Ledger.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "Ledger")
+-- PURE. Pays each order once. The wallet only grows through complete(), and complete() refuses repeats.
+-- In V0.1 this lives in server memory only. Saving (DataStore) is deferred.
+
+local Ledger = {}
+
+function Ledger.new()
+	return { balance = 0, completed = {} }
+end
+
+-- Returns true, "PAID" on the first valid completion.
+-- Returns false, "ALREADY_PAID" for a repeat, and false, "INVALID" for a bad order id or payout.
+function Ledger.complete(l, orderId, payout)
+	if type(orderId) ~= "string" or orderId == "" then
+		return false, "INVALID"
+	end
+	if type(payout) ~= "number" or payout ~= payout or payout &lt;= 0 or payout &gt; 1000000 or payout ~= math.floor(payout) then
+		return false, "INVALID"
+	end
+	if l.completed[orderId] then
+		return false, "ALREADY_PAID"
+	end
+	l.completed[orderId] = true
+	l.balance = l.balance + payout
+	return true, "PAID"
+end
+
+function Ledger.isComplete(l, orderId)
+	return l.completed[orderId] == true
+end
+
+function Ledger.balanceOf(l)
+	return l.balance
+end
+
+return Ledger
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBXEE30214195234617">
+        <Properties>
+          <string name="Name">Locale</string>
+          <ProtectedString name="Source">-- Locale.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "Locale")
+-- ALL translated text lives here. Codes, component ids, slot ids and protocol names never change with language.
+-- PURE: no Roblox APIs. describe() takes the catalog as an argument.
+-- Arabic text: Modern Standard Arabic. Brand names stay in Latin script. Arabic rendering is NOT TESTED IN ROBLOX STUDIO.
+
+local Locale = {}
+
+function Locale.isRtl(lang)
+	return lang == "ar"
+end
+
+local UI = {
+	en = {
+		["ui.camera"] = "Camera",
+		["ui.rotL"] = "Rotate -",
+		["ui.rotR"] = "Rotate +",
+		["ui.drop"] = "Drop",
+		["ui.screw"] = "Screw",
+		["ui.remove"] = "Remove",
+		["ui.boot"] = "Boot",
+		["ui.lang_to_ar"] = "عربي",
+		["ui.lang_to_en"] = "English",
+		["ui.start"] = "Tap a part to pick it up. Drag to move it, then release on a glowing socket to install.",
+		["ui.selectFirst"] = "Tap a part first.",
+		["ui.selectInstalled"] = "Tap an installed part first.",
+		["ui.holdFirst"] = "Pick a part up first, then rotate it.",
+		["ui.installedHint"] = "This part is installed. Use Screw or Remove.",
+		["ui.more"] = "(+{n} more)",
+		["ui.sent"] = "Sent. Waiting for the server...",
+		["ui.preview_free"] = "Free placement on the bench. It will not be installed.",
+		["ui.preview_snap"] = "Release to install in {slot}.",
+		["ui.selected"] = "Selected. Drag it to move, or use the buttons.",
+		["ui.waitingPickup"] = "Picking up...",
+		["ui.stillPending"] = "This part is still being placed. Wait a moment.",
+		["ui.pickupTimeout"] = "No answer from the server. Try again.",
+		["ui.wallet"] = "Wallet: {amount}$",
+		["ui.order_line"] = "Order: {order} · needs {ram} GB RAM, {storage} GB storage · {state}",
+		["ui.order_open"] = "in progress",
+		["ui.order_done"] = "complete",
+		["ui.selected_part"] = "Selected: {part}",
+		["ui.diag_title"] = "Boot diagnostics",
+		["ui.close"] = "Close",
+		["ui.gone"] = "That part is no longer in the workshop.",
+	},
+	ar = {
+		["ui.camera"] = "الكاميرا",
+		["ui.rotL"] = "تدوير -",
+		["ui.rotR"] = "تدوير +",
+		["ui.drop"] = "إفلات",
+		["ui.screw"] = "شدّ برغي",
+		["ui.remove"] = "إزالة",
+		["ui.boot"] = "تشغيل",
+		["ui.lang_to_ar"] = "عربي",
+		["ui.lang_to_en"] = "English",
+		["ui.start"] = "اضغط على قطعة لالتقاطها. اسحبها للتحريك، ثم أفلتها على مقبس مضيء لتركيبها.",
+		["ui.selectFirst"] = "اضغط على قطعة أولاً.",
+		["ui.selectInstalled"] = "اضغط على قطعة مُركّبة أولاً.",
+		["ui.holdFirst"] = "التقط قطعة أولاً، ثم أدرها.",
+		["ui.installedHint"] = "هذه القطعة مُركّبة. استخدم «شدّ برغي» أو «إزالة».",
+		["ui.more"] = "(+{n} أخرى)",
+		["ui.sent"] = "أُرسل الطلب. بانتظار تأكيد الخادم...",
+		["ui.preview_free"] = "وضع حر على الطاولة. لن تُركَّب القطعة.",
+		["ui.preview_snap"] = "أفلت للتركيب في {slot}.",
+		["ui.selected"] = "تم تحديد القطعة. اسحبها للتحريك، أو استخدم الأزرار.",
+		["ui.waitingPickup"] = "جارٍ الالتقاط...",
+		["ui.stillPending"] = "هذه القطعة ما زالت قيد الوضع. انتظر لحظة.",
+		["ui.pickupTimeout"] = "لم يصل ردّ من الخادم. حاول مرة أخرى.",
+		["ui.wallet"] = "الرصيد: {amount}$",
+		["ui.order_line"] = "الطلب: {order} · يحتاج {ram} غيغابايت ذاكرة و{storage} غيغابايت تخزين · {state}",
+		["ui.order_open"] = "قيد التنفيذ",
+		["ui.order_done"] = "مكتمل",
+		["ui.selected_part"] = "المحدد: {part}",
+		["ui.diag_title"] = "تشخيص التشغيل",
+		["ui.close"] = "إغلاق",
+		["ui.gone"] = "هذه القطعة لم تعد في الورشة.",
+	},
+}
+
+-- Message templates. {name} placeholders are filled from params. "hint" is optional.
+local CODES = {
+	en = {
+		UNKNOWN_COMPONENT = { msg = "Unknown part: {part}." },
+		UNKNOWN_SLOT = { msg = "Unknown install point: {slot}." },
+		ALREADY_INSTALLED = { msg = "{part} is already installed.", hint = "Remove it first to move it." },
+		SLOT_OCCUPIED = { msg = "{slot} is already taken.", hint = "Remove the part in that spot first." },
+		WRONG_PART_FOR_SLOT = { msg = "{part} does not fit this spot.", hint = "This spot takes: {kind}." },
+		PARENT_NOT_INSTALLED = { msg = "Install the base part first.", hint = "Missing: {slot}." },
+		FORMFACTOR_MISMATCH = { msg = "{part} ({formFactor}) does not fit this case.", hint = "This case supports: {caseForm}." },
+		SOCKET_MISMATCH = { msg = "{part} does not fit this motherboard socket.", hint = "This board uses the {socket} socket." },
+		RAM_TYPE_MISMATCH = { msg = "{part} is the wrong memory type for this board.", hint = "This board takes {ramType} memory." },
+		CABLE_WRONG_PORT = { msg = "{part} goes to a different port.", hint = "Match the cable to the port label." },
+		PSU_CABLE_UNAVAILABLE = { msg = "The power supply has no {cableType} cable.", hint = "Use a power supply that provides it." },
+		HAS_DEPENDENTS = { msg = "Cannot remove {part} yet.", hint = "{other} depends on it. Remove that first." },
+		NOT_INSTALLED = { msg = "Nothing is installed there." },
+		NO_SCREWS_NEEDED = { msg = "{part} has no screws left to tighten." },
+		NO_MOTHERBOARD = { msg = "No motherboard installed.", hint = "Mount the motherboard in the case." },
+		NO_PSU = { msg = "No power supply installed.", hint = "Install it in the PSU bay." },
+		NO_CPU = { msg = "No CPU installed.", hint = "Install a CPU on the motherboard." },
+		NO_RAM = { msg = "No memory installed.", hint = "Install at least one memory module." },
+		NO_STORAGE = { msg = "No storage drive installed.", hint = "The PC has nothing to boot from." },
+		MISSING_CABLE = { msg = "Missing cable: {slot} is not connected.", hint = "Connect the matching cable." },
+		SCREWS_INCOMPLETE = { msg = "{part} is loose ({have}/{need} screws).", hint = "Tighten all of its screws." },
+		PSU_INSUFFICIENT = { msg = "Power supply too weak: needs about {needW}W, has {watts}W.", hint = "Install a stronger power supply." },
+		ORDER_RAM_TOO_LOW = { msg = "The order needs {need}GB of RAM. This build has {have}GB.", hint = "Add more memory." },
+		ORDER_STORAGE_TOO_SMALL = { msg = "The order needs {need}GB of storage. This build has {have}GB.", hint = "Install a larger drive." },
+		INSTALLED = { msg = "{part} installed in {slot}." },
+		PICKED_UP = { msg = "Picked up." },
+		REMOVED = { msg = "{part} removed.", hint = "Its screws came out with it." },
+		PLACED_FREE = { msg = "{part} placed on the bench." },
+		SCREW_ADDED = { msg = "Screw {have}/{need} tightened on {part}." },
+		NOT_HELD = { msg = "Pick the part up first." },
+		NOT_IN_WORKSHOP = { msg = "That part is not in your workshop." },
+		LOCKED_INSTALLED = { msg = "Installed parts are locked.", hint = "Use Screw or Remove." },
+		TOO_FAR = { msg = "Too far away.", hint = "Walk closer to the bench." },
+		OUT_OF_BOUNDS = { msg = "That spot is outside the workbench area." },
+		NOT_ALIGNED = { msg = "Rotate the part to match the socket." },
+		NO_SOCKET = { msg = "Socket missing in the workshop model.", hint = "Check the Studio setup." },
+		RATE_LIMITED = { msg = "Too many requests.", hint = "Wait a moment." },
+		BOOT_FAILED = { msg = "The PC does not boot.", hint = "Read the diagnostics below." },
+		ORDER_NOT_MET = { msg = "The PC boots, but it does not meet the order yet." },
+		ORDER_DONE = { msg = "{order} complete. +${payout}. Wallet: ${wallet}." },
+		ORDER_ALREADY_DONE = { msg = "The PC boots. This order is already complete." },
+		WORKSHOP_READY = { msg = "Workshop ready. Tap a part to pick it up." },
+		WORKSHOP_NOT_SET = { msg = "The workshop is not set up yet (Studio setup missing)." },
+		OVERLAPS_PART = { msg = "{part} would overlap another part.", hint = "Find an empty spot on the table." },
+		OVERLAPS_CASE = { msg = "Parts cannot be placed inside the case.", hint = "Use a socket to install it." },
+		BELOW_TABLE = { msg = "That spot is below the table top.", hint = "Lift the part above the table." },
+		OFF_TABLE = { msg = "That spot is past the edge of the table.", hint = "Move the part back onto the table top." },
+		REQUEST_INVALID = { msg = "That request was not valid.", hint = "Try the action again." },
+	},
+	ar = {
+		UNKNOWN_COMPONENT = { msg = "قطعة غير معروفة: {part}." },
+		UNKNOWN_SLOT = { msg = "نقطة تركيب غير معروفة: {slot}." },
+		ALREADY_INSTALLED = { msg = "{part} مُركّبة بالفعل.", hint = "أزِلها أولاً لنقلها." },
+		SLOT_OCCUPIED = { msg = "{slot} مشغول.", hint = "أزِل القطعة الموجودة في هذا الموضع أولاً." },
+		WRONG_PART_FOR_SLOT = { msg = "{part} لا يناسب هذا الموضع.", hint = "هذا الموضع يستقبل: {kind}." },
+		PARENT_NOT_INSTALLED = { msg = "ركّب القطعة الأساسية أولاً.", hint = "الناقص: {slot}." },
+		FORMFACTOR_MISMATCH = { msg = "{part} ({formFactor}) لا يناسب هذا الهيكل.", hint = "هذا الهيكل يدعم: {caseForm}." },
+		SOCKET_MISMATCH = { msg = "{part} لا يناسب مقبس هذه اللوحة الأم.", hint = "هذه اللوحة تستخدم المقبس {socket}." },
+		RAM_TYPE_MISMATCH = { msg = "{part} من نوع ذاكرة غير مناسب لهذه اللوحة.", hint = "هذه اللوحة تستخدم ذاكرة {ramType}." },
+		CABLE_WRONG_PORT = { msg = "{part} يُوصَل بمنفذ آخر.", hint = "طابِق الكابل مع اسم المنفذ." },
+		PSU_CABLE_UNAVAILABLE = { msg = "مزود الطاقة لا يوفّر كابل {cableType}.", hint = "استخدم مزود طاقة يوفّره." },
+		HAS_DEPENDENTS = { msg = "لا يمكن إزالة {part} الآن.", hint = "{other} تعتمد عليها. أزِلها أولاً." },
+		NOT_INSTALLED = { msg = "لا توجد قطعة مُركّبة هنا." },
+		NO_SCREWS_NEEDED = { msg = "لا توجد براغٍ متبقية لشدّها في {part}." },
+		NO_MOTHERBOARD = { msg = "لا توجد لوحة أم مُركّبة.", hint = "ركّب اللوحة الأم في الهيكل." },
+		NO_PSU = { msg = "لا يوجد مزود طاقة مُركّب.", hint = "ركّبه في حاضنته." },
+		NO_CPU = { msg = "لا يوجد معالج مُركّب.", hint = "ركّب معالجاً على اللوحة الأم." },
+		NO_RAM = { msg = "لا توجد ذاكرة مُركّبة.", hint = "ركّب وحدة ذاكرة واحدة على الأقل." },
+		NO_STORAGE = { msg = "لا يوجد قرص تخزين مُركّب.", hint = "الجهاز لا يملك ما يقلع منه." },
+		MISSING_CABLE = { msg = "كابل مفقود: {slot} غير متصل.", hint = "وصّل الكابل المناسب." },
+		SCREWS_INCOMPLETE = { msg = "{part} غير مثبّتة جيداً ({have}/{need} براغٍ).", hint = "اشدّ جميع براغيها." },
+		PSU_INSUFFICIENT = { msg = "مزود الطاقة ضعيف: يحتاج نحو {needW} واط، والمتوفر {watts} واط.", hint = "ركّب مزود طاقة أقوى." },
+		ORDER_RAM_TOO_LOW = { msg = "الطلب يحتاج ذاكرة بسعة {need} غيغابايت، وهذا التجميع فيه {have} غيغابايت.", hint = "أضف ذاكرة." },
+		ORDER_STORAGE_TOO_SMALL = { msg = "الطلب يحتاج تخزيناً بسعة {need} غيغابايت، وهذا التجميع فيه {have} غيغابايت.", hint = "ركّب قرصاً أكبر." },
+		INSTALLED = { msg = "تم تركيب {part} في {slot}." },
+		PICKED_UP = { msg = "تم الالتقاط." },
+		REMOVED = { msg = "أُزيلت {part}.", hint = "أُزيلت براغيها معها." },
+		PLACED_FREE = { msg = "وُضعت {part} على الطاولة." },
+		SCREW_ADDED = { msg = "تم شدّ البرغي {have}/{need} في {part}." },
+		NOT_HELD = { msg = "التقط القطعة أولاً." },
+		NOT_IN_WORKSHOP = { msg = "هذه القطعة ليست في ورشتك." },
+		LOCKED_INSTALLED = { msg = "القطع المُركّبة مقفلة.", hint = "استخدم «شدّ برغي» أو «إزالة»." },
+		TOO_FAR = { msg = "بعيد جداً.", hint = "اقترب من طاولة العمل." },
+		OUT_OF_BOUNDS = { msg = "هذا الموضع خارج منطقة طاولة العمل." },
+		NOT_ALIGNED = { msg = "أدِر القطعة لتطابق المقبس." },
+		NO_SOCKET = { msg = "المقبس غير موجود في نموذج الورشة.", hint = "راجع إعداد Studio." },
+		RATE_LIMITED = { msg = "طلبات كثيرة جداً.", hint = "انتظر لحظة." },
+		BOOT_FAILED = { msg = "الجهاز لا يقلع.", hint = "اقرأ التشخيص أدناه." },
+		ORDER_NOT_MET = { msg = "الجهاز يقلع، لكنه لا يحقق الطلب بعد." },
+		ORDER_DONE = { msg = "اكتمل طلب {order}. +{payout}$ الرصيد: {wallet}$." },
+		ORDER_ALREADY_DONE = { msg = "الجهاز يقلع. هذا الطلب مكتمل بالفعل." },
+		WORKSHOP_READY = { msg = "الورشة جاهزة. اضغط على قطعة لالتقاطها." },
+		WORKSHOP_NOT_SET = { msg = "الورشة غير مُعدّة بعد (إعداد Studio ناقص)." },
+		OVERLAPS_PART = { msg = "{part} سيتداخل مع قطعة أخرى.", hint = "ابحث عن مكان فارغ على الطاولة." },
+		OVERLAPS_CASE = { msg = "لا يمكن وضع القطع داخل الهيكل.", hint = "استخدم مقبساً لتركيبها." },
+		BELOW_TABLE = { msg = "هذا الموضع أسفل سطح الطاولة.", hint = "ارفع القطعة فوق الطاولة." },
+		OFF_TABLE = { msg = "هذا الموضع خارج حافة الطاولة.", hint = "أعد القطعة إلى سطح الطاولة." },
+		REQUEST_INVALID = { msg = "الطلب غير صالح.", hint = "أعد المحاولة." },
+	},
+}
+
+local SLOTS = {
+	en = {
+		CASE_MB = "Motherboard mount", CASE_PSU = "PSU bay", MB_CPU = "CPU socket",
+		MB_RAM1 = "RAM slot 1", MB_RAM2 = "RAM slot 2", MB_M2 = "M.2 slot",
+		MB_PWR24 = "24-pin power port", MB_CPU8 = "CPU power port (8-pin)",
+	},
+	ar = {
+		CASE_MB = "حامل اللوحة الأم", CASE_PSU = "حاضنة مزود الطاقة", MB_CPU = "مقبس المعالج",
+		MB_RAM1 = "فتحة الذاكرة 1", MB_RAM2 = "فتحة الذاكرة 2", MB_M2 = "فتحة M.2",
+		MB_PWR24 = "منفذ الطاقة 24 سن", MB_CPU8 = "منفذ طاقة المعالج (8 سن)",
+	},
+}
+
+local KINDS = {
+	en = { Case = "Case", PSU = "Power supply", Motherboard = "Motherboard", CPU = "CPU", RAM = "Memory", Storage = "Storage", Cable = "Cable" },
+	ar = { Case = "هيكل", PSU = "مزود الطاقة", Motherboard = "اللوحة الأم", CPU = "المعالج", RAM = "الذاكرة", Storage = "التخزين", Cable = "كابل" },
+}
+
+local ORDERS = {
+	en = { office_01 = "Office PC" },
+	ar = { office_01 = "حاسوب مكتب" },
+}
+
+function Locale.text(lang, key)
+	local table_ = UI[lang] or UI.en
+	return table_[key] or UI.en[key] or key
+end
+
+function Locale.slotLabel(lang, slotId)
+	return (SLOTS[lang] or SLOTS.en)[slotId] or tostring(slotId)
+end
+
+local function resolve(lang, name, value, catalog)
+	if name == "part" or name == "other" then
+		local comp = catalog and catalog.Components[value]
+		if comp ~= nil then
+			return comp.name
+		end
+		return tostring(value)
+	elseif name == "slot" then
+		return Locale.slotLabel(lang, value)
+	elseif name == "kind" then
+		return (KINDS[lang] or KINDS.en)[value] or tostring(value)
+	elseif name == "order" then
+		return (ORDERS[lang] or ORDERS.en)[value] or tostring(value)
+	end
+	return tostring(value)
+end
+
+-- Returns (message, hint). hint is "" when the code has none. Unknown codes never crash.
+function Locale.describe(lang, code, params, catalog)
+	local entry = (CODES[lang] or CODES.en)[code] or CODES.en[code]
+	if entry == nil then
+		return "[" .. tostring(code) .. "]", ""
+	end
+	params = params or {}
+	local function fill(template)
+		local out = string.gsub(template, "{(%w+)}", function(name)
+			return resolve(lang, name, params[name], catalog)
+		end)
+		return out
+	end
+	local hint = ""
+	if entry.hint ~= nil then
+		hint = fill(entry.hint)
+	end
+	return fill(entry.msg), hint
+end
+
+-- Used by tests: every code known in one language must exist in the other.
+local function specText(lang, comp)
+	local ar = lang == "ar"
+	if comp.kind == "CPU" then
+		return (ar and "مقبس " or "Socket ") .. comp.socket .. " · " .. tostring(comp.tdp) .. (ar and " واط" or " W")
+	elseif comp.kind == "Motherboard" then
+		return comp.formFactor .. " · " .. comp.cpuSocket .. " · " .. comp.ramType
+	elseif comp.kind == "RAM" then
+		return tostring(comp.capacityGB) .. (ar and " غيغابايت " or " GB ") .. comp.ramType
+	elseif comp.kind == "Storage" then
+		return tostring(comp.capacityGB) .. (ar and " غيغابايت" or " GB")
+	elseif comp.kind == "PSU" then
+		return tostring(comp.watts) .. (ar and " واط" or " W")
+	elseif comp.kind == "Case" then
+		return table.concat(comp.formFactors, ", ")
+	elseif comp.kind == "Cable" then
+		return comp.cableType
+	end
+	return ""
+end
+
+-- One line describing a product: kind, name and its key spec. Brand and model names stay in Latin script.
+function Locale.partLine(lang, componentId, catalog)
+	local comp = catalog.Components[componentId]
+	if comp == nil then
+		return tostring(componentId)
+	end
+	local kind = (KINDS[lang] or KINDS.en)[comp.kind] or comp.kind
+	local spec = specText(lang, comp)
+	if spec == "" then
+		return kind .. ": " .. comp.name
+	end
+	return kind .. ": " .. comp.name .. " (" .. spec .. ")"
+end
+
+-- The order status line. order is a catalog order entry. done is a boolean.
+function Locale.orderLine(lang, order, done)
+	if order == nil then
+		return ""
+	end
+	local name = (ORDERS[lang] or ORDERS.en)[order.id] or order.id
+	local state = Locale.text(lang, done and "ui.order_done" or "ui.order_open")
+	local line = Locale.text(lang, "ui.order_line")
+	line = string.gsub(line, "{order}", name)
+	line = string.gsub(line, "{ram}", tostring(order.minRamGB))
+	line = string.gsub(line, "{storage}", tostring(order.minStorageGB))
+	line = string.gsub(line, "{state}", state)
+	return line
+end
+
+function Locale.codeList(lang)
+	local list = {}
+	for code in pairs(CODES[lang] or {}) do
+		table.insert(list, code)
+	end
+	table.sort(list)
+	return list
+end
+
+function Locale.uiKeys(lang)
+	local list = {}
+	for key in pairs(UI[lang] or {}) do
+		table.insert(list, key)
+	end
+	table.sort(list)
+	return list
+end
+
+return Locale
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBXC6DCD561AB0C4AAC">
+        <Properties>
+          <string name="Name">PlacementRules</string>
+          <ProtectedString name="Source">-- PlacementRules.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "PlacementRules")
+-- PURE geometry on plain tables {x, y, z}. No Roblox APIs. Server authoritative; client uses it for preview only.
+-- Poses are { pos = point, up = point, look = point }. point() reads .X/.Y/.Z, so Vector3 values work directly.
+
+local PlacementRules = {}
+
+function PlacementRules.point(v)
+	return { x = v.X, y = v.Y, z = v.Z }
+end
+
+function PlacementRules.poseFromVectors(pos, up, look)
+	return { pos = PlacementRules.point(pos), up = PlacementRules.point(up), look = PlacementRules.point(look) }
+end
+
+function PlacementRules.distance(a, b)
+	local dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function dot(a, b)
+	return a.x * b.x + a.y * b.y + a.z * b.z
+end
+
+function PlacementRules.cosLimit(degrees)
+	return math.cos(math.rad(degrees))
+end
+
+-- NaN fails every comparison, so NaN positions are rejected.
+function PlacementRules.inBounds(pos, origin, half)
+	return math.abs(pos.x - origin.x) &lt;= half.x
+		and math.abs(pos.y - origin.y) &lt;= half.y
+		and math.abs(pos.z - origin.z) &lt;= half.z
+end
+
+function PlacementRules.inReach(player, pos, maxDist)
+	return PlacementRules.distance(player, pos) &lt;= maxDist
+end
+
+function PlacementRules.aligned(pose, target, cosLimit)
+	return dot(pose.up, target.up) &gt;= cosLimit and dot(pose.look, target.look) &gt;= cosLimit
+end
+
+-- cfg = { installReach, cosLimit }. Returns true, or false plus a code.
+function PlacementRules.checkInstallPose(pose, target, cfg)
+	if not (PlacementRules.distance(pose.pos, target.pos) &lt;= cfg.installReach) then
+		return false, "TOO_FAR"
+	end
+	if not PlacementRules.aligned(pose, target, cfg.cosLimit) then
+		return false, "NOT_ALIGNED"
+	end
+	return true, nil
+end
+
+function PlacementRules.checkFreePose(pose, playerPos, origin, half, maxDist)
+	if not PlacementRules.inBounds(pose.pos, origin, half) then
+		return false, "OUT_OF_BOUNDS"
+	end
+	if not PlacementRules.inReach(playerPos, pose.pos, maxDist) then
+		return false, "TOO_FAR"
+	end
+	return true, nil
+end
+
+-- candidates: list of { slotId, pose }. Returns the nearest one within radius, or nil.
+function PlacementRules.nearest(candidates, pos, radius)
+	local best, bestD = nil, radius
+	for _, c in ipairs(candidates) do
+		local d = PlacementRules.distance(pos, c.pose.pos)
+		if d &lt;= bestD then
+			best = c
+			bestD = d
+		end
+	end
+	return best
+end
+
+-- Snap target choice. candidates: list of { slotId, pose }, where pose is the socket pose. pos: the proposed point.
+-- Each candidate within radius is tried from nearest to farthest with evaluate(candidate) -&gt; ok, code, params.
+-- Returns the first candidate that passes, as candidate, true, nil, {}. When none passes, returns the nearest
+-- in-range candidate with its refusal, as candidate, false, code, params. When nothing is in range, returns nil.
+function PlacementRules.chooseSnap(candidates, pos, radius, evaluate)
+	local inRange = {}
+	for _, c in ipairs(candidates) do
+		local d = PlacementRules.distance(pos, c.pose.pos)
+		if d &lt;= radius then
+			table.insert(inRange, { candidate = c, d = d })
+		end
+	end
+	table.sort(inRange, function(a, b) return a.d &lt; b.d end)
+	local firstRefusal = nil
+	for _, entry in ipairs(inRange) do
+		local ok, code, params = evaluate(entry.candidate)
+		if ok then
+			return entry.candidate, true, nil, {}
+		end
+		if firstRefusal == nil then
+			firstRefusal = { candidate = entry.candidate, code = code, params = params or {} }
+		end
+	end
+	if firstRefusal ~= nil then
+		return firstRefusal.candidate, false, firstRefusal.code, firstRefusal.params
+	end
+	return nil, false, nil, {}
+end
+
+-- Converts a layout array {x, y, z} into a point {x = , y = , z = }.
+function PlacementRules.fromArray(a)
+	return { x = a[1], y = a[2], z = a[3] }
+end
+
+local function overlapAxis(a, b, sa, sb, margin)
+	return math.abs(a - b) &lt; (sa + sb) / 2 - margin
+end
+
+-- Axis-aligned overlap in one shared space. Centres are points, sizes are arrays {x, y, z}.
+-- margin lets touching boxes pass. NaN never overlaps, so callers check finiteness first.
+function PlacementRules.boxesOverlap(centerA, sizeA, centerB, sizeB, margin)
+	local m = margin or 0
+	return overlapAxis(centerA.x, centerB.x, sizeA[1], sizeB[1], m)
+		and overlapAxis(centerA.y, centerB.y, sizeA[2], sizeB[2], m)
+		and overlapAxis(centerA.z, centerB.z, sizeA[3], sizeB[3], m)
+end
+
+-- True when the box bottom is at or above the surface, within tolerance.
+function PlacementRules.bottomAbove(center, size, surfaceY, tolerance)
+	return (center.y - size[2] / 2) &gt;= surfaceY - tolerance
+end
+
+-- True when the box lies fully on the table top in x and z. A part may touch the table edge, not overhang it.
+-- Height is checked separately by bottomAbove.
+function PlacementRules.insideFootprint(center, size, tableCenter, tableSize)
+	local hx, hz = size[1] / 2, size[3] / 2
+	local tx, tz = tableSize[1] / 2, tableSize[3] / 2
+	return center.x - hx &gt;= tableCenter.x - tx
+		and center.x + hx &lt;= tableCenter.x + tx
+		and center.z - hz &gt;= tableCenter.z - tz
+		and center.z + hz &lt;= tableCenter.z + tz
+end
+
+-- candidate and others: { id, componentId, center = point, size = array }.
+-- caseBox: { center = point, size = array } or nil.
+-- tableBox: { center = point, size = array } or nil. When given, the part must stay on the table top (OFF_TABLE).
+-- Returns true, or false with a code and params.
+function PlacementRules.checkFreeLayout(candidate, others, caseBox, surfaceY, tableBox)
+	if not PlacementRules.bottomAbove(candidate.center, candidate.size, surfaceY, 0.6) then
+		return false, "BELOW_TABLE", {}
+	end
+	if tableBox ~= nil and not PlacementRules.insideFootprint(candidate.center, candidate.size, tableBox.center, tableBox.size) then
+		return false, "OFF_TABLE", {}
+	end
+	if caseBox ~= nil and PlacementRules.boxesOverlap(candidate.center, candidate.size, caseBox.center, caseBox.size, 0.05) then
+		return false, "OVERLAPS_CASE", {}
+	end
+	for _, other in ipairs(others) do
+		if PlacementRules.boxesOverlap(candidate.center, candidate.size, other.center, other.size, 0.05) then
+			return false, "OVERLAPS_PART", { part = other.componentId }
+		end
+	end
+	return true, nil, {}
+end
+
+return PlacementRules
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBXA523B8BBEB054924">
+        <Properties>
+          <string name="Name">PointerTracker</string>
+          <ProtectedString name="Source">-- PointerTracker.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "PointerTracker")
+-- PURE. Decides which pointer may drive a drag. Only one pointer is active at a time.
+-- Touch: only the touch that started the drag can move or end it. Other fingers are ignored.
+-- Mouse: any mouse movement moves the drag. Releasing the mouse button ends it.
+-- A handle is an identity object. In Roblox it is the InputObject that began the press.
+
+local PointerTracker = {}
+
+function PointerTracker.new()
+	return { active = nil }
+end
+
+-- Starts tracking. Returns false when another pointer is already active, or the kind is unknown.
+function PointerTracker.begin(t, handle, kind)
+	if t.active ~= nil then
+		return false
+	end
+	if kind ~= "touch" and kind ~= "mouse" then
+		return false
+	end
+	t.active = { handle = handle, kind = kind }
+	return true
+end
+
+function PointerTracker.acceptsMove(t, handle, kind)
+	local a = t.active
+	if a == nil then
+		return false
+	end
+	if a.kind == "mouse" then
+		return kind == "mouse"
+	end
+	return kind == "touch" and handle ~= nil and handle == a.handle
+end
+
+function PointerTracker.acceptsEnd(t, handle, kind)
+	local a = t.active
+	if a == nil then
+		return false
+	end
+	if a.kind == "mouse" then
+		return kind == "mouse"
+	end
+	return kind == "touch" and handle ~= nil and handle == a.handle
+end
+
+function PointerTracker.finish(t)
+	t.active = nil
+end
+
+function PointerTracker.isActive(t)
+	return t.active ~= nil
+end
+
+return PointerTracker
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX9A04E1441FED43A2">
+        <Properties>
+          <string name="Name">RateLimit</string>
+          <ProtectedString name="Source">-- RateLimit.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "RateLimit")
+-- PURE fixed-window limiter. The server creates one per player. Time is passed in, so it is testable.
+
+local RateLimit = {}
+RateLimit.__index = RateLimit
+
+function RateLimit.new(limits)
+	return setmetatable({ limits = limits, buckets = {} }, RateLimit)
+end
+
+-- Returns true if the action is allowed now. Unknown actions are always refused.
+function RateLimit:allow(action, now)
+	local limit = self.limits[action]
+	if limit == nil then
+		return false
+	end
+	local bucket = self.buckets[action]
+	if bucket == nil or now - bucket.start &gt;= 1 then
+		self.buckets[action] = { start = now, count = 1 }
+		return true
+	end
+	if bucket.count &gt;= limit then
+		return false
+	end
+	bucket.count = bucket.count + 1
+	return true
+end
+
+return RateLimit
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX5E96F29108F042B7">
+        <Properties>
+          <string name="Name">RemoteLayout</string>
+          <ProtectedString name="Source">-- RemoteLayout.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "RemoteLayout")
+-- PURE. Decides how the server must set up its RemoteEvent folder, given what already exists.
+-- The server collects the top-level objects with the folder name and passes them in. Nothing is changed here.
+-- Rule: when anything is ambiguous or wrong, STOP and report. Never guess, never silently replace existing objects.
+
+local RemoteLayout = {}
+
+local function findChildrenNamed(children, name)
+	local found = {}
+	for _, child in ipairs(children) do
+		if child.name == name then
+			table.insert(found, child)
+		end
+	end
+	return found
+end
+
+-- folderName: expected folder name. required: RemoteEvent names. topLevel: { { name, className, children } }.
+-- Returns { ok, action = "use_existing" | "create_folder" | "stop", create = { names }, issues = { { code, params } } }
+function RemoteLayout.plan(folderName, required, topLevel)
+	local matches = {}
+	for _, obj in ipairs(topLevel) do
+		if obj.name == folderName then
+			table.insert(matches, obj)
+		end
+	end
+
+	if #matches == 0 then
+		local create = {}
+		for _, name in ipairs(required) do
+			table.insert(create, name)
+		end
+		return { ok = true, action = "create_folder", create = create, issues = {} }
+	end
+
+	-- The client resolves the folder by name. Two candidates would make the two sides disagree.
+	if #matches &gt; 1 then
+		return { ok = false, action = "stop", create = {}, issues = { { code = "DUPLICATE_FOLDER", params = { name = folderName, count = #matches } } } }
+	end
+
+	local folder = matches[1]
+	if folder.className ~= "Folder" then
+		return { ok = false, action = "stop", create = {}, issues = { { code = "NAME_TAKEN_BY_NON_FOLDER", params = { name = folderName, className = folder.className } } } }
+	end
+
+	local children = folder.children or {}
+	local issues, create = {}, {}
+	for _, name in ipairs(required) do
+		local found = findChildrenNamed(children, name)
+		if #found == 0 then
+			table.insert(create, name)
+		elseif #found &gt; 1 then
+			table.insert(issues, { code = "DUPLICATE_REMOTE", params = { name = name, count = #found } })
+		elseif found[1].className ~= "RemoteEvent" then
+			table.insert(issues, { code = "WRONG_REMOTE_CLASS", params = { name = name, className = found[1].className } })
+		end
+	end
+
+	if #issues &gt; 0 then
+		return { ok = false, action = "stop", create = {}, issues = issues }
+	end
+	return { ok = true, action = "use_existing", create = create, issues = {} }
+end
+
+return RemoteLayout
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX43BE5A7644394314">
+        <Properties>
+          <string name="Name">RequestGuard</string>
+          <ProtectedString name="Source">-- RequestGuard.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "RequestGuard")
+-- PURE checks for every argument a client can send. Malformed input is rejected before any state changes.
+-- Points may be tables with x, y, z OR Vector3 values with X, Y, Z. Both are accepted.
+
+local RequestGuard = {}
+
+local MAX_ID_LENGTH = 64
+local MAX_COORD = 1000000
+
+function RequestGuard.isId(value)
+	return type(value) == "string"
+		and #value &gt;= 1
+		and #value &lt;= MAX_ID_LENGTH
+		and string.find(value, "^[%w_#]+$") ~= nil
+end
+
+-- Rejects NaN (n ~= n), infinities and absurdly large values.
+function RequestGuard.isFiniteNumber(n)
+	return type(n) == "number" and n == n and n &gt; -MAX_COORD and n &lt; MAX_COORD
+end
+
+function RequestGuard.isFinitePoint(p)
+	if p == nil then
+		return false
+	end
+	local ok, x, y, z = pcall(function()
+		return p.X or p.x, p.Y or p.y, p.Z or p.z
+	end)
+	return ok and RequestGuard.isFiniteNumber(x) and RequestGuard.isFiniteNumber(y) and RequestGuard.isFiniteNumber(z)
+end
+
+function RequestGuard.isComponentId(value, catalog)
+	return type(value) == "string" and catalog.Components[value] ~= nil
+end
+
+-- A slot id, or the empty string, which means free placement on the bench.
+function RequestGuard.isSlotOrFree(value, catalog)
+	if value == "" then
+		return true
+	end
+	return type(value) == "string" and catalog.Slots[value] ~= nil
+end
+
+-- A pose is a position plus two direction vectors (pos, look, up). All three must be finite: a NaN orientation
+-- reaches PivotTo just as a NaN position would. Points may be tables or Vector3 values.
+function RequestGuard.isFinitePose(pose)
+	if type(pose) ~= "table" then
+		return false
+	end
+	return RequestGuard.isFinitePoint(pose.pos)
+		and RequestGuard.isFinitePoint(pose.look)
+		and RequestGuard.isFinitePoint(pose.up)
+end
+
+-- Every remote handler goes through here. The limiter runs first, so a malformed request also uses a token and
+-- cannot flood the server with free replies. valid is the handler's own argument check.
+-- Returns nil when the request may proceed, otherwise the code to reply with.
+function RequestGuard.admit(limiter, action, now, valid)
+	if not limiter:allow(action, now) then
+		return "RATE_LIMITED"
+	end
+	if not valid then
+		return "REQUEST_INVALID"
+	end
+	return nil
+end
+
+return RequestGuard
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBXA00E435F5C054285">
+        <Properties>
+          <string name="Name">SessionHold</string>
+          <ProtectedString name="Source">-- SessionHold.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "SessionHold")
+-- PURE state for "which part this player is holding" on the server. One part at a time.
+-- Rules that protect the player:
+--   * pick replaces any earlier hold (the client never starts a second pick during a drag),
+--   * release always takes effect, and is idempotent,
+--   * every proposal ends the hold, whatever the outcome, so a rejected drop never leaves a part in hand.
+
+local SessionHold = {}
+
+function SessionHold.new()
+	return { held = nil }
+end
+
+-- Returns the previously held id, or nil.
+function SessionHold.pick(h, id)
+	local previous = h.held
+	h.held = id
+	return previous
+end
+
+function SessionHold.heldId(h)
+	return h.held
+end
+
+-- Clears the hold only if it is this part. Returns true when something was cleared.
+function SessionHold.release(h, id)
+	if id ~= nil and h.held == id then
+		h.held = nil
+		return true
+	end
+	return false
+end
+
+-- Called by every proposal. Returns true when the part was held (the proposal is for the held part).
+function SessionHold.consume(h, id)
+	local was = id ~= nil and h.held == id
+	if was then
+		h.held = nil
+	end
+	return was
+end
+
+return SessionHold
+</ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0ED8F5D697594646">
+        <Properties>
+          <string name="Name">WorkshopLayout</string>
+          <ProtectedString name="Source">-- WorkshopLayout.lua
+-- Place in: ReplicatedStorage &gt; Shared (ModuleScript "WorkshopLayout")
+-- PURE DATA. Placeholder workshop geometry in studs. The origin is the workshop origin at ground level.
+-- Points and sizes are arrays {x, y, z}. Sizes are full extents. Geometry is PLACEHOLDER (plain blocks).
+-- Replacing art later must keep these numbers consistent with the rules, or the tests will say so.
+-- Lua 5.1 subset.
+
+local L = {}
+
+L.TableTopY = 3
+L.Floor = { center = { 0, -0.5, 0 }, size = { 80, 1, 80 } }
+L.Table = { center = { 0, 1.5, -1.5 }, size = { 44, 3, 13 } }
+
+-- The case is open at the front and top. Its base rests on the table.
+L.Case = { center = { 0, 9, -1.5 }, size = { 12, 12, 9 } }
+L.CaseWalls = {
+	{ center = { 0, 3.2, -1.5 }, size = { 12, 0.4, 9 } },
+	{ center = { -5.8, 9, -1.5 }, size = { 0.4, 12, 9 } },
+	{ center = { 5.8, 9, -1.5 }, size = { 0.4, 12, 9 } },
+	{ center = { 0, 9, -5.8 }, size = { 12, 12, 0.4 } },
+}
+
+-- Case install points, absolute workshop coordinates.
+L.CaseSockets = {
+	CASE_MB = { 0, 9, -5.0 },
+	CASE_PSU = { 0, 4.65, -4.0 },
+}
+
+-- Board install points, offsets from the motherboard centre (board-local).
+L.BoardSockets = {
+	MB_CPU = { -1.5, 2.8, 0.4 },
+	MB_RAM1 = { 2.0, 2.0, 0.45 },
+	MB_RAM2 = { 2.7, 2.0, 0.45 },
+	MB_M2 = { -2.8, -2.5, 0.35 },
+	MB_PWR24 = { 3.8, 3.5, 0.35 },
+	MB_CPU8 = { 3.8, 1.0, 0.35 },
+}
+
+L.Light = { center = { 6.3, 13, 2.5 }, size = { 0.6, 0.6, 0.3 } }
+
+-- The player stands here and faces the bench. Every interaction point must be in reach from here.
+L.StandPoint = { 0, 3, 7 }
+L.BenchFocus = { 0, 6, -1.5 }
+
+-- Bin spots on the table as {x, z}. Spot i is for the i-th starter item (kit order, then extras).
+-- Parts sit on the table, so their centre height is TableTopY + sizeY / 2.
+L.BinSpots = {
+	{ -11, -5 },    -- 1 PSU
+	{ 12.5, -1 },   -- 2 motherboard: its own spot, because it is 10 studs wide
+	{ -8.5, -1 },   -- 3 CPU (kit)
+	{ -11, 2 },     -- 4 RAM (kit)
+	{ -8.5, 2 },    -- 5 SSD (kit)
+	{ -11, 4.5 },   -- 6 cable, 24-pin (kit)
+	{ -8.5, 4.5 },  -- 7 cable, 8-pin CPU (kit)
+	{ 8.5, 2 },     -- 8 CPU, wrong socket (extra)
+	{ 11, 2 },      -- 9 RAM, wrong type (extra)
+}
+
+-- Placeholder geometry per product. Colours are RGB in 0..1. Labels are short, language-neutral model names.
+L.Components = {
+	case_corsair_4000d = { kind = "Case", size = { 12, 12, 9 }, color = { 0.12, 0.12, 0.14 }, label = "4000D" },
+	psu_corsair_rm550 = { kind = "PSU", size = { 4, 2.5, 3 }, color = { 0.10, 0.10, 0.12 }, label = "RM550" },
+	mb_asus_b760m = { kind = "Motherboard", size = { 10, 10, 0.4 }, color = { 0.10, 0.30, 0.20 }, label = "B760M" },
+	cpu_intel_i5_12400f = { kind = "CPU", size = { 2.2, 2.2, 0.4 }, color = { 0.70, 0.72, 0.78 }, label = "i5-12400F" },
+	cpu_amd_ryzen5_5600 = { kind = "CPU", size = { 2.2, 2.2, 0.4 }, color = { 0.70, 0.72, 0.78 }, label = "R5 5600" },
+	ram_corsair_lpx_8_ddr4 = { kind = "RAM", size = { 0.5, 3, 0.5 }, color = { 0.20, 0.45, 0.85 }, label = "8GB DDR4" },
+	ram_corsair_vengeance_8_ddr5 = { kind = "RAM", size = { 0.5, 3, 0.5 }, color = { 0.20, 0.45, 0.85 }, label = "8GB DDR5" },
+	ssd_samsung_980_500 = { kind = "Storage", size = { 2.8, 0.9, 0.3 }, color = { 0.18, 0.18, 0.20 }, label = "980 500GB" },
+	cable_rm550_mb24 = { kind = "Cable", size = { 0.5, 1.6, 0.3 }, color = { 0.92, 0.92, 0.92 }, label = "24-pin" },
+	cable_rm550_cpu8 = { kind = "Cable", size = { 0.5, 1.6, 0.3 }, color = { 0.92, 0.92, 0.92 }, label = "8-pin CPU" },
+}
+
+return L
+</ProtectedString>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="RBX60E0B6F3D3A84039">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="RBXBFF50400A6DA4F68">
+      <Properties>
+        <string name="Name">AssemblyServer</string>
+        <ProtectedString name="Source">-- AssemblyServer.server.lua
+-- Place in: ServerScriptService (Script named "AssemblyServer")
+-- ROLE: the authoritative workshop. Validates every request, enforces ownership, places parts,
+--       runs the boot and order checks, and pays each order once. Clients send requests only.
+-- Replies carry codes and params, never display text. The client translates them.
+-- STATUS: NOT YET RUN INSIDE ROBLOX STUDIO.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = require(Shared:WaitForChild("Config"))
+local Catalog = require(Shared:WaitForChild("Catalog"))
+local AssemblyRules = require(Shared:WaitForChild("AssemblyRules"))
+local PlacementRules = require(Shared:WaitForChild("PlacementRules"))
+local RateLimit = require(Shared:WaitForChild("RateLimit"))
+local RemoteLayout = require(Shared:WaitForChild("RemoteLayout"))
+local RequestGuard = require(Shared:WaitForChild("RequestGuard"))
+local SessionHold = require(Shared:WaitForChild("SessionHold"))
+local Ledger = require(Shared:WaitForChild("Ledger"))
+local WorkshopLayout = require(Shared:WaitForChild("WorkshopLayout"))
+local Decisions = require(Shared:WaitForChild("Decisions"))
+local WorkshopBuilder = require(script.Parent:WaitForChild("WorkshopBuilder"))
+
+local INSTALL_CFG = {
+	installReach = Config.InstallReachStuds,
+	cosLimit = PlacementRules.cosLimit(Config.SnapAngleDegrees),
+}
+local BENCH_HALF = Config.BenchHalfExtents
+local TABLE_TOP = WorkshopLayout.TableTopY
+local CASE_BOX = {
+	center = PlacementRules.fromArray(WorkshopLayout.Case.center),
+	size = WorkshopLayout.Case.size,
+}
+local TABLE_BOX = {
+	center = PlacementRules.fromArray(WorkshopLayout.Table.center),
+	size = WorkshopLayout.Table.size,
+}
+local BOOT_COLORS = {
+	idle = Color3.fromRGB(120, 120, 120),
+	ok = Color3.fromRGB(60, 220, 110),
+	fail = Color3.fromRGB(230, 70, 70),
+}
+
+-- Legacy path: hand-built templates. Used only when BOTH templates exist in ServerStorage.
+local templates = ServerStorage:FindFirstChild("ComponentTemplates")
+local workshopTemplate = ServerStorage:FindFirstChild("WorkshopTemplate")
+local useLegacy = templates ~= nil and workshopTemplate ~= nil
+if useLegacy then
+	print("[AssemblyServer] Using the hand-built templates in ServerStorage.")
+end
+
+local workshopsFolder = Workspace:FindFirstChild("Workshops")
+if workshopsFolder == nil then
+	workshopsFolder = Instance.new("Folder")
+	workshopsFolder.Name = "Workshops"
+	workshopsFolder.Parent = Workspace
+end
+
+-- Remote setup. Deterministic: reuse one valid folder, create only what is missing, STOP on any conflict.
+local function describeIssue(issue)
+	local p = issue.params
+	if issue.code == "DUPLICATE_FOLDER" then
+		return "Found " .. p.count .. " objects named '" .. p.name .. "' directly under ReplicatedStorage. Keep exactly one Folder with that name."
+	elseif issue.code == "NAME_TAKEN_BY_NON_FOLDER" then
+		return "'" .. p.name .. "' under ReplicatedStorage is a " .. p.className .. ", not a Folder. Rename or remove it."
+	elseif issue.code == "DUPLICATE_REMOTE" then
+		return "'" .. p.name .. "' appears " .. p.count .. " times inside the Folder. Keep exactly one RemoteEvent with that name."
+	elseif issue.code == "WRONG_REMOTE_CLASS" then
+		return "'" .. p.name .. "' inside the Folder is a " .. p.className .. ", but it must be a RemoteEvent."
+	end
+	return "Unknown remote setup issue: " .. tostring(issue.code)
+end
+
+local function collectTopLevel(folderName)
+	local list = {}
+	for _, child in ipairs(ReplicatedStorage:GetChildren()) do
+		if child.Name == folderName then
+			local entry = { name = child.Name, className = child.ClassName, children = {} }
+			for _, grandchild in ipairs(child:GetChildren()) do
+				table.insert(entry.children, { name = grandchild.Name, className = grandchild.ClassName })
+			end
+			table.insert(list, entry)
+		end
+	end
+	return list
+end
+
+local remoteFolder = nil
+local layout = RemoteLayout.plan(Config.RemoteFolderName, Config.RemoteNames, collectTopLevel(Config.RemoteFolderName))
+for _, issue in ipairs(layout.issues) do
+	warn("[AssemblyServer] Remote setup conflict: " .. describeIssue(issue))
+end
+if layout.action == "stop" then
+	warn("[AssemblyServer] Remote setup STOPPED. Nothing was created or changed in ReplicatedStorage. Fix the conflict above, then press Play again.")
+else
+	if layout.action == "create_folder" then
+		local created = Instance.new("Folder")
+		created.Name = Config.RemoteFolderName
+		created.Parent = ReplicatedStorage
+	end
+	local folder = ReplicatedStorage:FindFirstChild(Config.RemoteFolderName)
+	for _, name in ipairs(layout.create) do
+		local event = Instance.new("RemoteEvent")
+		event.Name = name
+		event.Parent = folder
+	end
+	local verified = folder ~= nil
+	for _, name in ipairs(Config.RemoteNames) do
+		local event = folder and folder:FindFirstChild(name)
+		if event == nil or not event:IsA("RemoteEvent") then
+			verified = false
+			warn("[AssemblyServer] Could not verify RemoteEvent '" .. name .. "' after setup.")
+		end
+	end
+	if verified then
+		remoteFolder = folder
+	else
+		warn("[AssemblyServer] Remote setup did not verify. Workshops stay disabled until this is fixed.")
+	end
+end
+
+local sessions = {}
+local workshopCount = 0
+
+-- kind: "system" | "pickup" | "placement" | "uninstall" | "screw" | "boot"
+local function notify(player, kind, ok, code, params, extra)
+	if remoteFolder == nil then
+		return
+	end
+	extra = extra or {}
+	remoteFolder.Feedback:FireClient(player, {
+		kind = kind,
+		ok = ok,
+		code = code,
+		params = params or {},
+		instanceId = extra.instanceId,
+		diagnostics = extra.diagnostics or {},
+		final = extra.final,
+	})
+end
+
+local function notifyInvalid(player, kind, instanceId)
+	notify(player, kind, false, "REQUEST_INVALID", {}, { instanceId = RequestGuard.isId(instanceId) and instanceId or nil })
+end
+
+local function rootPoint(player)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root == nil then
+		return nil
+	end
+	return PlacementRules.point(root.Position)
+end
+
+local function poseOf(cf)
+	return PlacementRules.poseFromVectors(cf.Position, cf.UpVector, cf.LookVector)
+end
+
+local function setAnchored(model, anchored)
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = anchored
+		end
+	end
+end
+
+-- Socket parts live on the case, or on the installed owner part (the motherboard for board sockets).
+local function findSocket(session, slotId)
+	local slot = Catalog.Slots[slotId]
+	if slot == nil then
+		return nil
+	end
+	local owner
+	if slot.ownerSlot == nil then
+		owner = session.workshop:FindFirstChild("Case")
+	else
+		local ownerInstance = session.state.slots[slot.ownerSlot]
+		owner = ownerInstance and session.parts[ownerInstance]
+	end
+	if owner == nil then
+		return nil
+	end
+	local socket = owner:FindFirstChild(slotId, true)
+	if socket and socket:IsA("BasePart") then
+		return socket
+	end
+	return nil
+end
+
+-- Screw progress shown above an installed part that needs screws.
+local function hostOf(model)
+	return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function setScrewLabel(model, have, need)
+	local host = hostOf(model)
+	if host == nil or need &lt;= 0 then
+		return
+	end
+	local gui = host:FindFirstChild("ScrewLabel")
+	if gui == nil then
+		gui = Instance.new("BillboardGui")
+		gui.Name = "ScrewLabel"
+		gui.Size = UDim2.fromOffset(60, 18)
+		gui.StudsOffset = Vector3.new(0, host.Size.Y / 2 + 3.4, 0)
+		gui.MaxDistance = 40
+		gui.Parent = host
+		local t = Instance.new("TextLabel")
+		t.Name = "Text"
+		t.Size = UDim2.fromScale(1, 1)
+		t.BackgroundTransparency = 0.2
+		t.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+		t.TextColor3 = Color3.fromRGB(255, 220, 120)
+		t.TextScaled = true
+		t.Font = Enum.Font.GothamBold
+		t.Parent = gui
+	end
+	local text = gui:FindFirstChild("Text")
+	if text ~= nil then
+		text.Text = tostring(have) .. "/" .. tostring(need)
+	end
+end
+
+local function clearScrewLabel(model)
+	local host = hostOf(model)
+	local gui = host and host:FindFirstChild("ScrewLabel")
+	if gui ~= nil then
+		gui:Destroy()
+	end
+end
+
+local function placeInstalled(session, componentId, instanceId, slotId, socket)
+	local model = session.parts[instanceId]
+	model:PivotTo(socket.CFrame)
+	setAnchored(model, true)
+	model:SetAttribute("SlotId", slotId)
+	model:SetAttribute("Installed", true)
+	AssemblyRules.applyInstall(session.state, componentId, instanceId, slotId)
+end
+
+local function setBootState(s, state)
+	s.workshop:SetAttribute("BootState", state)
+	if s.led ~= nil then
+		s.led.Color = BOOT_COLORS[state] or BOOT_COLORS.idle
+	end
+end
+
+-- Layout context for Decisions.free, in workshop coordinates: table top, case interior, and other parts.
+-- Returns nil for legacy parts that have no size data.
+local function layoutFor(s, instanceId, pose)
+	local size = s.sizes[instanceId]
+	if size == nil then
+		return nil -- legacy templates: no layout data, so no layout checks
+	end
+	local model = s.parts[instanceId]
+	local centre = PlacementRules.point(s.origin:PointToObjectSpace(pose.Position))
+	local others = {}
+	for otherId, otherModel in pairs(s.parts) do
+		if otherId ~= instanceId and s.sizes[otherId] ~= nil then
+			table.insert(others, {
+				id = otherId,
+				componentId = otherModel:GetAttribute("ComponentId"),
+				center = PlacementRules.point(s.origin:PointToObjectSpace(otherModel:GetPivot().Position)),
+				size = s.sizes[otherId],
+			})
+		end
+	end
+	local candidate = { id = instanceId, componentId = model:GetAttribute("ComponentId"), center = centre, size = size }
+	return { candidate = candidate, others = others, caseBox = s.caseBox, surfaceY = TABLE_TOP, tableBox = TABLE_BOX }
+end
+
+local function starterList()
+	local list = {}
+	for _, id in ipairs(Catalog.StarterPC.kit) do
+		table.insert(list, id)
+	end
+	for _, id in ipairs(Catalog.StarterPC.extras) do
+		table.insert(list, id)
+	end
+	return list
+end
+
+local function spawnParts(session)
+	for index, componentId in ipairs(starterList()) do
+		local instanceId = componentId .. "#" .. index
+		local model, home, size
+		if session.legacy then
+			local template = templates:FindFirstChild(componentId)
+			if template == nil then
+				warn("[AssemblyServer] Missing component template: " .. componentId)
+			else
+				model = template:Clone()
+				local column = (index - 1) % 4
+				local row = math.floor((index - 1) / 4)
+				home = session.legacyBin * CFrame.new(column * Config.BinSpacing, 0, row * Config.BinSpacing)
+				local ext = model:GetExtentsSize()
+				size = { ext.X, ext.Y, ext.Z }
+			end
+		else
+			model = WorkshopBuilder.buildComponent(componentId)
+			home = WorkshopBuilder.binHome(index, componentId, session.origin)
+			local entry = WorkshopLayout.Components[componentId]
+			size = entry and { entry.size[1], entry.size[2], entry.size[3] } or nil
+		end
+		if model ~= nil and home ~= nil then
+			model.Name = componentId
+			model:SetAttribute("ComponentId", componentId)
+			model:SetAttribute("InstanceId", instanceId)
+			model:SetAttribute("Installed", false)
+			model:SetAttribute("Owner", session.player.UserId)
+			model:PivotTo(home)
+			setAnchored(model, true)
+			model.Parent = session.workshop
+			session.parts[instanceId] = model
+			session.homeCFrame[instanceId] = home
+			session.sizes[instanceId] = size
+		end
+	end
+end
+
+local function placeCharacter(player)
+	local s = sessions[player]
+	local character = player.Character
+	if s == nil or character == nil then
+		return
+	end
+	local stand = WorkshopLayout.StandPoint
+	local focus = WorkshopLayout.BenchFocus
+	local standWorld = s.origin * CFrame.new(stand[1], stand[2], stand[3])
+	local focusWorld = s.origin * CFrame.new(focus[1], focus[2], focus[3])
+	character:PivotTo(CFrame.new(standWorld.Position, focusWorld.Position))
+end
+
+local function createSession(player)
+	if remoteFolder == nil or sessions[player] ~= nil then
+		return
+	end
+	workshopCount = workshopCount + 1
+	local workshop, led
+	if useLegacy then
+		workshop = workshopTemplate:Clone()
+	else
+		workshop, led = WorkshopBuilder.buildWorkshop()
+	end
+	workshop.Name = tostring(player.UserId)
+	workshop:PivotTo(CFrame.new(workshopCount * Config.WorkshopSpacing, 0, 0))
+	workshop:SetAttribute("Owner", player.UserId)
+	workshop:SetAttribute("CaseId", Catalog.StarterPC.caseId)
+	workshop:SetAttribute("OrderId", Catalog.StarterPC.orderId)
+	workshop:SetAttribute("OrderDone", false)
+	workshop:SetAttribute("Wallet", 0)
+	workshop:SetAttribute("BootState", "idle")
+	workshop.Parent = workshopsFolder
+
+	local origin = workshop:GetPivot()
+	local legacyBin = origin
+	if useLegacy then
+		local bin = workshop:FindFirstChild("PartsBin")
+		if bin ~= nil and bin:IsA("BasePart") then
+			legacyBin = bin.CFrame
+		end
+	end
+	local session = {
+		player = player,
+		workshop = workshop,
+		origin = origin,
+		benchOrigin = PlacementRules.point(origin.Position),
+		legacy = useLegacy,
+		legacyBin = legacyBin,
+		caseBox = (not useLegacy) and CASE_BOX or nil,
+		led = led,
+		state = AssemblyRules.newState(Catalog.StarterPC.caseId),
+		parts = {},
+		homeCFrame = {},
+		sizes = {},
+		hold = SessionHold.new(),
+		limiter = RateLimit.new(Config.RateLimit),
+		ledger = Ledger.new(),
+	}
+	sessions[player] = session
+	spawnParts(session)
+	placeCharacter(player)
+	notify(player, "system", true, "WORKSHOP_READY", {})
+end
+
+-- ---------- request handlers: every one validates its arguments first ----------
+
+local function onPickUp(player, instanceId)
+	local s = sessions[player]
+	if s == nil then return end
+	local admitCode = RequestGuard.admit(s.limiter, "PickUp", os.clock(), RequestGuard.isId(instanceId))
+	if admitCode == "REQUEST_INVALID" then return notifyInvalid(player, "pickup", instanceId) end
+	if admitCode == "RATE_LIMITED" then return notify(player, "pickup", false, "RATE_LIMITED", {}, { instanceId = instanceId }) end
+	local model = s.parts[instanceId]
+	if model == nil or model:GetAttribute("Owner") ~= player.UserId then
+		return notify(player, "pickup", false, "NOT_IN_WORKSHOP", {}, { instanceId = instanceId })
+	end
+	if s.state.instances[instanceId] ~= nil then
+		return notify(player, "pickup", false, "LOCKED_INSTALLED", {}, { instanceId = instanceId })
+	end
+	local root = rootPoint(player)
+	if root == nil or not PlacementRules.inReach(root, PlacementRules.point(model:GetPivot().Position), Config.MaxInteractDistance) then
+		return notify(player, "pickup", false, "TOO_FAR", {}, { instanceId = instanceId })
+	end
+	SessionHold.pick(s.hold, instanceId)
+	return notify(player, "pickup", true, "PICKED_UP", {}, { instanceId = instanceId })
+end
+
+local function onReleaseHold(player, instanceId)
+	local s = sessions[player]
+	if s == nil then return end
+	if not RequestGuard.isId(instanceId) then return end
+	s.limiter:allow("ReleaseHold", os.clock()) -- counted only: a release always takes effect
+	SessionHold.release(s.hold, instanceId)
+end
+
+-- The client proposes a pose. An empty slotId means free placement on the bench.
+local function onProposePlacement(player, instanceId, pose, slotId)
+	local s = sessions[player]
+	if s == nil then return end
+	local validArgs = RequestGuard.isId(instanceId)
+		and RequestGuard.isSlotOrFree(slotId, Catalog)
+		and typeof(pose) == "CFrame"
+		and RequestGuard.isFinitePose({ pos = pose.Position, look = pose.LookVector, up = pose.UpVector })
+	-- Every proposal ends the hold attempt, whatever the outcome. Only a well-formed id can own a hold.
+	local wasHeld = RequestGuard.isId(instanceId) and SessionHold.consume(s.hold, instanceId) or false
+	local admitCode = RequestGuard.admit(s.limiter, "ProposePlacement", os.clock(), validArgs)
+	if admitCode == "REQUEST_INVALID" then
+		return notifyInvalid(player, "placement", instanceId)
+	end
+	if admitCode == "RATE_LIMITED" then
+		return notify(player, "placement", false, "RATE_LIMITED", {}, { instanceId = instanceId })
+	end
+	if not wasHeld then
+		return notify(player, "placement", false, "NOT_HELD", {}, { instanceId = instanceId })
+	end
+	local model = s.parts[instanceId]
+	if model == nil or model:GetAttribute("Owner") ~= player.UserId then
+		return notify(player, "placement", false, "NOT_IN_WORKSHOP", {}, { instanceId = instanceId })
+	end
+	local root = rootPoint(player)
+	if root == nil then
+		return notify(player, "placement", false, "TOO_FAR", {}, { instanceId = instanceId })
+	end
+	local componentId = model:GetAttribute("ComponentId")
+	local proposed = poseOf(pose)
+
+	-- Free placement on the bench. The shared decision checks reach, bounds, height, table top, case and other parts.
+	if slotId == "" then
+		local okFree, codeFree, paramsFree = Decisions.free({
+			player = root,
+			proposed = proposed,
+			benchOrigin = s.benchOrigin,
+			benchHalf = BENCH_HALF,
+			maxReach = Config.MaxInteractDistance,
+			layout = layoutFor(s, instanceId, pose),
+		})
+		if not okFree then
+			return notify(player, "placement", false, codeFree, paramsFree or {}, { instanceId = instanceId })
+		end
+		model:PivotTo(pose)
+		setAnchored(model, true)
+		return notify(player, "placement", true, "PLACED_FREE", { part = componentId }, { instanceId = instanceId, final = pose })
+	end
+
+	-- Install into a socket. The same shared decision the client preview uses: rules, bounds, socket, reach, alignment.
+	local socket = findSocket(s, slotId)
+	local okInstall, codeInstall, paramsInstall = Decisions.install({
+		state = s.state,
+		catalog = Catalog,
+		componentId = componentId,
+		instanceId = instanceId,
+		slotId = slotId,
+		proposed = proposed,
+		socket = socket and poseOf(socket.CFrame) or nil,
+		player = root,
+		benchOrigin = s.benchOrigin,
+		benchHalf = BENCH_HALF,
+		maxReach = Config.MaxInteractDistance,
+		cfg = INSTALL_CFG,
+	})
+	if not okInstall then
+		return notify(player, "placement", false, codeInstall, paramsInstall or {}, { instanceId = instanceId })
+	end
+	placeInstalled(s, componentId, instanceId, slotId, socket)
+	setScrewLabel(model, 0, Catalog.Components[componentId].screwsRequired or 0)
+	return notify(player, "placement", true, "INSTALLED", { part = componentId, slot = slotId }, { instanceId = instanceId, final = socket.CFrame })
+end
+
+local function onRequestUninstall(player, instanceId)
+	local s = sessions[player]
+	if s == nil then return end
+	local admitCode = RequestGuard.admit(s.limiter, "RequestUninstall", os.clock(), RequestGuard.isId(instanceId))
+	if admitCode == "REQUEST_INVALID" then return notifyInvalid(player, "uninstall", instanceId) end
+	if admitCode == "RATE_LIMITED" then return notify(player, "uninstall", false, "RATE_LIMITED", {}) end
+	local model = s.parts[instanceId]
+	if model == nil or model:GetAttribute("Owner") ~= player.UserId then
+		return notify(player, "uninstall", false, "NOT_IN_WORKSHOP", {}, { instanceId = instanceId })
+	end
+	local root = rootPoint(player)
+	if root == nil or not PlacementRules.inReach(root, PlacementRules.point(model:GetPivot().Position), Config.MaxInteractDistance) then
+		return notify(player, "uninstall", false, "TOO_FAR", {}, { instanceId = instanceId })
+	end
+	local ok, diag = AssemblyRules.validateUninstall(s.state, Catalog, instanceId)
+	if not ok then
+		return notify(player, "uninstall", false, diag.code, diag.params, { instanceId = instanceId })
+	end
+	local componentId = model:GetAttribute("ComponentId")
+	AssemblyRules.applyUninstall(s.state, instanceId)
+	model:PivotTo(s.homeCFrame[instanceId])
+	model:SetAttribute("SlotId", nil)
+	model:SetAttribute("Installed", false)
+	clearScrewLabel(model)
+	return notify(player, "uninstall", true, "REMOVED", { part = componentId }, { instanceId = instanceId })
+end
+
+local function onTightenScrew(player, instanceId)
+	local s = sessions[player]
+	if s == nil then return end
+	local admitCode = RequestGuard.admit(s.limiter, "TightenScrew", os.clock(), RequestGuard.isId(instanceId))
+	if admitCode == "REQUEST_INVALID" then return notifyInvalid(player, "screw", instanceId) end
+	if admitCode == "RATE_LIMITED" then return notify(player, "screw", false, "RATE_LIMITED", {}) end
+	local model = s.parts[instanceId]
+	if model == nil or model:GetAttribute("Owner") ~= player.UserId then
+		return notify(player, "screw", false, "NOT_IN_WORKSHOP", {}, { instanceId = instanceId })
+	end
+	local root = rootPoint(player)
+	if root == nil or not PlacementRules.inReach(root, PlacementRules.point(model:GetPivot().Position), Config.MaxInteractDistance) then
+		return notify(player, "screw", false, "TOO_FAR", {}, { instanceId = instanceId })
+	end
+	local ok, diag = AssemblyRules.validateTighten(s.state, Catalog, instanceId)
+	if not ok then
+		return notify(player, "screw", false, diag.code, diag.params, { instanceId = instanceId })
+	end
+	AssemblyRules.applyTighten(s.state, instanceId)
+	local inst = s.state.instances[instanceId]
+	local need = Catalog.Components[inst.componentId].screwsRequired or 0
+	local have = s.state.screws[instanceId]
+	setScrewLabel(model, have, need)
+	return notify(player, "screw", true, "SCREW_ADDED", { part = inst.componentId, have = have, need = need }, { instanceId = instanceId })
+end
+
+local function onRequestBoot(player)
+	local s = sessions[player]
+	if s == nil then return end
+	if not s.limiter:allow("RequestBoot", os.clock()) then return notify(player, "boot", false, "RATE_LIMITED", {}) end
+
+	-- Boot and order are both decided here. The client cannot declare either one passed.
+	local boot = AssemblyRules.evaluateBoot(s.state, Catalog)
+	if not boot.ok then
+		setBootState(s, "fail")
+		return notify(player, "boot", false, "BOOT_FAILED", {}, { diagnostics = boot.diagnostics })
+	end
+	local order = Catalog.Orders[Catalog.StarterPC.orderId]
+	setBootState(s, "ok")
+	local ok, diagnostics = AssemblyRules.evaluateOrder(s.state, Catalog, order)
+	if not ok then
+		return notify(player, "boot", false, "ORDER_NOT_MET", {}, { diagnostics = diagnostics })
+	end
+	local paid = Ledger.complete(s.ledger, order.id, order.payout)
+	if not paid then
+		return notify(player, "boot", true, "ORDER_ALREADY_DONE", {})
+	end
+	local balance = Ledger.balanceOf(s.ledger)
+	s.workshop:SetAttribute("OrderDone", true)
+	s.workshop:SetAttribute("Wallet", balance)
+	return notify(player, "boot", true, "ORDER_DONE", { order = order.id, payout = order.payout, wallet = balance })
+end
+
+-- ---------- players ----------
+
+local function onPlayerAdded(player)
+	createSession(player)
+	player.CharacterAdded:Connect(function()
+		placeCharacter(player)
+	end)
+	if player.Character ~= nil then
+		placeCharacter(player)
+	end
+end
+
+local function onPlayerRemoving(player)
+	local s = sessions[player]
+	sessions[player] = nil
+	if s ~= nil and s.workshop ~= nil then
+		s.workshop:Destroy()
+	end
+end
+
+if remoteFolder ~= nil then
+	remoteFolder.PickUp.OnServerEvent:Connect(onPickUp)
+	remoteFolder.ReleaseHold.OnServerEvent:Connect(onReleaseHold)
+	remoteFolder.ProposePlacement.OnServerEvent:Connect(onProposePlacement)
+	remoteFolder.RequestUninstall.OnServerEvent:Connect(onRequestUninstall)
+	remoteFolder.TightenScrew.OnServerEvent:Connect(onTightenScrew)
+	remoteFolder.RequestBoot.OnServerEvent:Connect(onRequestBoot)
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+	for _, player in ipairs(Players:GetPlayers()) do
+		onPlayerAdded(player)
+	end
+end
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX0B19BFBCFE2842E7">
+      <Properties>
+        <string name="Name">WorkshopBuilder</string>
+        <ProtectedString name="Source">-- WorkshopBuilder.lua
+-- Place in: ServerScriptService (ModuleScript named "WorkshopBuilder")
+-- Builds the workshop and every product at runtime from WorkshopLayout (pure data).
+-- No manual modelling is needed in Studio. Geometry is PLACEHOLDER: labelled blocks.
+-- Socket markers are faint and cannot be picked, so players can see where parts go.
+-- STATUS: NOT YET RUN INSIDE ROBLOX STUDIO.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local WorkshopLayout = require(Shared:WaitForChild("WorkshopLayout"))
+
+local WorkshopBuilder = {}
+
+local function vec(a)
+	return Vector3.new(a[1], a[2], a[3])
+end
+
+local function colorOf(a)
+	return Color3.new(a[1], a[2], a[3])
+end
+
+local function newPart(name, size, cf, color, transparency, collide, query)
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Size = size
+	p.CFrame = cf
+	p.Anchored = true
+	p.CanCollide = collide
+	p.CanQuery = query
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Material = Enum.Material.SmoothPlastic
+	p.Color = color
+	p.Transparency = transparency
+	return p
+end
+
+local function socketMarker(slotId, centre)
+	return newPart(slotId, Vector3.new(0.6, 0.6, 0.6), CFrame.new(vec(centre)), Color3.fromRGB(120, 255, 150), 0.7, false, false)
+end
+
+local function addLabel(host, text, heightAbove)
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "Label"
+	gui.Size = UDim2.fromOffset(120, 22)
+	gui.StudsOffset = Vector3.new(0, heightAbove, 0)
+	gui.MaxDistance = 40
+	gui.Parent = host
+	local t = Instance.new("TextLabel")
+	t.Name = "Text"
+	t.Size = UDim2.fromScale(1, 1)
+	t.BackgroundTransparency = 0.25
+	t.BackgroundColor3 = Color3.fromRGB(15, 18, 28)
+	t.TextColor3 = Color3.new(1, 1, 1)
+	t.TextScaled = true
+	t.Font = Enum.Font.GothamBold
+	t.Text = text
+	t.Parent = gui
+end
+
+-- One product as a Model whose PrimaryPart (the body) is centred on the model pivot.
+-- A motherboard also gets its install points as child markers, in board-local offsets.
+function WorkshopBuilder.buildComponent(componentId)
+	local entry = WorkshopLayout.Components[componentId]
+	if entry == nil then
+		return nil
+	end
+	local model = Instance.new("Model")
+	model.Name = componentId
+	local body = newPart("Body", vec(entry.size), CFrame.new(), colorOf(entry.color), 0, true, true)
+	body.Parent = model
+	model.PrimaryPart = body
+	addLabel(body, entry.label, entry.size[2] / 2 + 1.2)
+	if entry.kind == "Motherboard" then
+		for slotId, centre in pairs(WorkshopLayout.BoardSockets) do
+			socketMarker(slotId, centre).Parent = model
+		end
+	end
+	return model
+end
+
+-- Where a product waits in the bin. spot is the table spot number (1-based). origin is the workshop origin.
+function WorkshopBuilder.binHome(index, componentId, origin)
+	local spot = WorkshopLayout.BinSpots[index]
+	local entry = WorkshopLayout.Components[componentId]
+	if spot == nil or entry == nil then
+		return nil
+	end
+	local y = WorkshopLayout.TableTopY + entry.size[2] / 2
+	return origin * CFrame.new(spot[1], y, spot[2])
+end
+
+-- The whole workshop: a pivot origin, floor, table, open-fronted case with its install points, and a power LED.
+-- Returns the Model and the LED part (the server changes its colour to show the boot state).
+function WorkshopBuilder.buildWorkshop()
+	local ws = Instance.new("Model")
+	ws.Name = "Workshop"
+	local origin = newPart("Origin", Vector3.new(1, 1, 1), CFrame.new(), Color3.new(1, 1, 1), 1, false, false)
+	origin.Parent = ws
+	ws.PrimaryPart = origin
+
+	local floor = WorkshopLayout.Floor
+	newPart("Floor", vec(floor.size), CFrame.new(vec(floor.center)), Color3.fromRGB(56, 58, 66), 0, true, true).Parent = ws
+	local tb = WorkshopLayout.Table
+	newPart("Table", vec(tb.size), CFrame.new(vec(tb.center)), Color3.fromRGB(110, 74, 42), 0, true, true).Parent = ws
+
+	local case = Instance.new("Model")
+	case.Name = "Case"
+	case.Parent = ws
+	for i, wall in ipairs(WorkshopLayout.CaseWalls) do
+		newPart("Wall" .. i, vec(wall.size), CFrame.new(vec(wall.center)), Color3.fromRGB(34, 36, 44), 0, true, true).Parent = case
+	end
+	for slotId, centre in pairs(WorkshopLayout.CaseSockets) do
+		socketMarker(slotId, centre).Parent = case
+	end
+
+	local light = WorkshopLayout.Light
+	local led = newPart("PowerLED", vec(light.size), CFrame.new(vec(light.center)), Color3.fromRGB(120, 120, 120), 0, false, true)
+	led.Parent = ws
+	return ws, led
+end
+
+return WorkshopBuilder
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="RBX46C801F3A8004D21">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="RBXE3BA1E7548864690">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="RBX518528D9D6D94C35">
+        <Properties>
+          <string name="Name">InteractionController</string>
+          <ProtectedString name="Source">-- InteractionController.client.lua
+-- Place in: StarterPlayer &gt; StarterPlayerScripts (LocalScript named "InteractionController")
+-- ROLE: input (touch and mouse), ghost prediction, placement preview with valid and invalid states,
+--       EN and AR interface with RTL, the full boot diagnostics panel, the order and wallet display,
+--       and the close-up camera. It sends requests only. The server decides every result.
+-- STATUS: NOT YET RUN INSIDE ROBLOX STUDIO. Touch identity, the camera sink and Arabic rendering are UNVERIFIED.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContextActionService = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = require(Shared:WaitForChild("Config"))
+local Catalog = require(Shared:WaitForChild("Catalog"))
+local AssemblyRules = require(Shared:WaitForChild("AssemblyRules"))
+local PlacementRules = require(Shared:WaitForChild("PlacementRules"))
+local Locale = require(Shared:WaitForChild("Locale"))
+local DragSequence = require(Shared:WaitForChild("DragSequence"))
+local PointerTracker = require(Shared:WaitForChild("PointerTracker"))
+local WorkshopLayout = require(Shared:WaitForChild("WorkshopLayout"))
+local Decisions = require(Shared:WaitForChild("Decisions"))
+
+local remotes = ReplicatedStorage:WaitForChild(Config.RemoteFolderName, 10)
+if remotes == nil or not remotes:IsA("Folder") then
+	warn("[InteractionController] Folder '" .. Config.RemoteFolderName .. "' was not found within 10 seconds. The server setup did not complete. Read the [AssemblyServer] messages in the Output window.")
+	return
+end
+local Remote = {}
+for _, name in ipairs(Config.RemoteNames) do
+	local event = remotes:WaitForChild(name, 10)
+	if event == nil or not event:IsA("RemoteEvent") then
+		warn("[InteractionController] RemoteEvent '" .. name .. "' is missing or is not a RemoteEvent. Read the [AssemblyServer] messages in the Output window.")
+		return
+	end
+	Remote[name] = event
+end
+
+local workshopsFolder = Workspace:WaitForChild("Workshops", 15)
+local workshop = workshopsFolder and workshopsFolder:WaitForChild(tostring(LocalPlayer.UserId), 15)
+if workshop == nil then
+	warn("[InteractionController] Workshop not found for this player. Check the server setup and the Output window.")
+	return
+end
+
+local COS_LIMIT = PlacementRules.cosLimit(Config.SnapAngleDegrees)
+local INSTALL_CFG = { installReach = Config.InstallReachStuds, cosLimit = COS_LIMIT }
+local BENCH_HALF = Config.BenchHalfExtents
+local SELECT_COLOR = Color3.fromRGB(80, 150, 255)
+local GHOST_COLORS = {
+	snap = Color3.fromRGB(70, 220, 110),
+	free = Color3.fromRGB(120, 170, 255),
+	invalid = Color3.fromRGB(235, 70, 70),
+}
+local DRAG_ACTION = "PCBuilderDragSink"
+
+local lang = Config.DefaultLanguage
+if string.sub(LocalPlayer.LocaleId or "", 1, 2) == "ar" then
+	lang = "ar"
+end
+
+local function tr(key)
+	return Locale.text(lang, key)
+end
+
+local function describeCode(code, params)
+	return Locale.describe(lang, code, params, Catalog)
+end
+
+-- ---------- HUD: top bar, order line, message, buttons, diagnostics panel ----------
+
+local hud = Instance.new("ScreenGui")
+hud.Name = "AssemblyHUD"
+hud.ResetOnSpawn = false
+hud.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local topBar = Instance.new("Frame")
+topBar.Name = "TopBar"
+topBar.Size = UDim2.new(0.96, 0, 0, 36)
+topBar.Position = UDim2.new(0.02, 0, 0, 6)
+topBar.BackgroundTransparency = 1
+topBar.Parent = hud
+
+local walletLabel = Instance.new("TextLabel")
+walletLabel.Name = "Wallet"
+walletLabel.Size = UDim2.new(0.6, 0, 1, 0)
+walletLabel.Position = UDim2.new(0, 0, 0, 0)
+walletLabel.BackgroundTransparency = 0.35
+walletLabel.BackgroundColor3 = Color3.fromRGB(15, 18, 28)
+walletLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
+walletLabel.TextScaled = true
+walletLabel.Font = Enum.Font.GothamBold
+walletLabel.Parent = topBar
+
+local langButton = Instance.new("TextButton")
+langButton.Name = "LanguageButton"
+langButton.Size = UDim2.new(0, 110, 1, 0)
+langButton.BackgroundColor3 = Color3.fromRGB(45, 45, 70)
+langButton.TextColor3 = Color3.new(1, 1, 1)
+langButton.TextScaled = true
+langButton.Font = Enum.Font.GothamBold
+langButton.Parent = topBar
+
+local orderLabel = Instance.new("TextLabel")
+orderLabel.Name = "Order"
+orderLabel.Size = UDim2.new(0.96, 0, 0, 26)
+orderLabel.Position = UDim2.new(0.02, 0, 0, 46)
+orderLabel.BackgroundTransparency = 0.35
+orderLabel.BackgroundColor3 = Color3.fromRGB(15, 18, 28)
+orderLabel.TextColor3 = Color3.new(1, 1, 1)
+orderLabel.TextScaled = true
+orderLabel.Font = Enum.Font.GothamMedium
+orderLabel.Parent = hud
+
+local message = Instance.new("TextLabel")
+message.Name = "Message"
+message.Size = UDim2.new(0.92, 0, 0, 124)
+message.Position = UDim2.new(0.04, 0, 0, 78)
+message.BackgroundTransparency = 0.35
+message.BackgroundColor3 = Color3.fromRGB(15, 18, 28)
+message.TextColor3 = Color3.new(1, 1, 1)
+message.TextWrapped = true
+message.TextYAlignment = Enum.TextYAlignment.Top
+message.TextSize = 15
+message.Font = Enum.Font.GothamMedium
+message.Parent = hud
+
+local bar = Instance.new("Frame")
+bar.Name = "ButtonBar"
+bar.Size = UDim2.new(0.96, 0, 0, 64)
+bar.Position = UDim2.new(0.02, 0, 1, -76)
+bar.BackgroundTransparency = 1
+bar.Parent = hud
+
+local barLayout = Instance.new("UIListLayout")
+barLayout.FillDirection = Enum.FillDirection.Horizontal
+barLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+barLayout.Padding = UDim.new(0.01, 0)
+barLayout.Parent = bar
+
+local buttons = {}
+local function addButton(key, onClick)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0.13, 0, 1, 0)
+	button.BackgroundColor3 = Color3.fromRGB(35, 60, 110)
+	button.TextColor3 = Color3.new(1, 1, 1)
+	button.TextScaled = true
+	button.Font = Enum.Font.GothamBold
+	button.Parent = bar
+	button.Activated:Connect(onClick)
+	table.insert(buttons, { button = button, key = key })
+end
+
+local diag = Instance.new("Frame")
+diag.Name = "Diagnostics"
+diag.Size = UDim2.new(0.92, 0, 0.72, 0)
+diag.Position = UDim2.new(0.04, 0, 0.14, 0)
+diag.BackgroundColor3 = Color3.fromRGB(12, 14, 22)
+diag.BackgroundTransparency = 0.05
+diag.Visible = false
+diag.ZIndex = 10
+diag.Parent = hud
+
+local diagTitle = Instance.new("TextLabel")
+diagTitle.Name = "Title"
+diagTitle.Size = UDim2.new(1, -16, 0, 34)
+diagTitle.Position = UDim2.new(0, 8, 0, 6)
+diagTitle.BackgroundTransparency = 1
+diagTitle.TextColor3 = Color3.new(1, 1, 1)
+diagTitle.TextScaled = true
+diagTitle.Font = Enum.Font.GothamBold
+diagTitle.ZIndex = 11
+diagTitle.Parent = diag
+
+local diagList = Instance.new("ScrollingFrame")
+diagList.Name = "List"
+diagList.Size = UDim2.new(1, -16, 1, -100)
+diagList.Position = UDim2.new(0, 8, 0, 44)
+diagList.BackgroundTransparency = 1
+diagList.BorderSizePixel = 0
+diagList.ScrollBarThickness = 6
+diagList.CanvasSize = UDim2.new(0, 0, 0, 0)
+diagList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+diagList.ZIndex = 11
+diagList.Parent = diag
+
+local diagLayout = Instance.new("UIListLayout")
+diagLayout.SortOrder = Enum.SortOrder.LayoutOrder
+diagLayout.Padding = UDim.new(0, 6)
+diagLayout.Parent = diagList
+
+local diagClose = Instance.new("TextButton")
+diagClose.Name = "Close"
+diagClose.Size = UDim2.new(0.5, 0, 0, 40)
+diagClose.Position = UDim2.new(0.25, 0, 1, -48)
+diagClose.BackgroundColor3 = Color3.fromRGB(35, 60, 110)
+diagClose.TextColor3 = Color3.new(1, 1, 1)
+diagClose.TextScaled = true
+diagClose.Font = Enum.Font.GothamBold
+diagClose.ZIndex = 11
+diagClose.Parent = diag
+diagClose.Activated:Connect(function()
+	diag.Visible = false
+end)
+
+-- Text shown in the message box. It is written only when it changes, to avoid relayout on every input event.
+local shownText = nil
+local lastPayload = nil
+local lastLocalText = nil
+local lastDiagnostics = {}
+
+local function show(text)
+	if text ~= shownText then
+		shownText = text
+		message.Text = text
+	end
+end
+
+local function showPayload(payload)
+	local msg, hint = describeCode(payload.code, payload.params)
+	local text = msg
+	if hint ~= "" then
+		text = text .. " " .. hint
+	end
+	local diags = payload.diagnostics or {}
+	for i = 1, math.min(#diags, 3) do
+		local dm, dh = describeCode(diags[i].code, diags[i].params)
+		text = text .. "\n- " .. dm
+		if dh ~= "" then
+			text = text .. " " .. dh
+		end
+	end
+	if #diags &gt; 3 then
+		local more = string.gsub(tr("ui.more"), "{n}", tostring(#diags - 3))
+		text = text .. "\n" .. more
+	end
+	show(text)
+end
+
+local function renderDiagnostics()
+	local rtl = Locale.isRtl(lang)
+	local align = rtl and Enum.TextXAlignment.Right or Enum.TextXAlignment.Left
+	diagTitle.Text = tr("ui.diag_title")
+	diagTitle.TextXAlignment = align
+	diagClose.Text = tr("ui.close")
+	for _, child in ipairs(diagList:GetChildren()) do
+		if child:IsA("TextLabel") then
+			child:Destroy()
+		end
+	end
+	for i, d in ipairs(lastDiagnostics) do
+		local msg, hint = describeCode(d.code, d.params)
+		local row = Instance.new("TextLabel")
+		row.LayoutOrder = i
+		row.Size = UDim2.new(1, -12, 0, 0)
+		row.AutomaticSize = Enum.AutomaticSize.Y
+		row.BackgroundTransparency = 0.3
+		row.BackgroundColor3 = Color3.fromRGB(28, 32, 46)
+		row.TextColor3 = Color3.new(1, 1, 1)
+		row.TextWrapped = true
+		row.TextSize = 15
+		row.Font = Enum.Font.GothamMedium
+		row.TextXAlignment = align
+		row.Text = (hint ~= "") and (msg .. "\n" .. hint) or msg
+		row.ZIndex = 12
+		row.Parent = diagList
+	end
+end
+
+local function openDiagnostics(list)
+	lastDiagnostics = list or {}
+	renderDiagnostics()
+	diag.Visible = true
+end
+
+-- Wallet and order line, read from the workshop attributes the server maintains.
+local function refreshLabels()
+	local amount = workshop:GetAttribute("Wallet") or 0
+	walletLabel.Text = string.gsub(tr("ui.wallet"), "{amount}", tostring(amount))
+	local order = nil
+	local orderId = workshop:GetAttribute("OrderId")
+	if orderId ~= nil then
+		order = Catalog.Orders[orderId]
+	end
+	orderLabel.Text = Locale.orderLine(lang, order, workshop:GetAttribute("OrderDone") == true)
+end
+
+local function applyLanguage()
+	local rtl = Locale.isRtl(lang)
+	local align = rtl and Enum.TextXAlignment.Right or Enum.TextXAlignment.Left
+	walletLabel.Position = rtl and UDim2.new(0.4, 0, 0, 0) or UDim2.new(0, 0, 0, 0)
+	walletLabel.TextXAlignment = align
+	langButton.Position = rtl and UDim2.new(0, 0, 0, 0) or UDim2.new(1, -110, 0, 0)
+	langButton.Text = tr(lang == "ar" and "ui.lang_to_en" or "ui.lang_to_ar")
+	orderLabel.TextXAlignment = align
+	message.TextXAlignment = align
+	for i, entry in ipairs(buttons) do
+		entry.button.Text = tr(entry.key)
+		entry.button.LayoutOrder = rtl and (#buttons - i + 1) or i
+	end
+	refreshLabels()
+	if lastPayload ~= nil then
+		showPayload(lastPayload)
+	elseif lastLocalText ~= nil then
+		show(lastLocalText)
+	else
+		show(tr("ui.start"))
+	end
+	if diag.Visible then
+		renderDiagnostics()
+	end
+end
+
+-- ---------- highlights and ghosts ----------
+
+local selectionHighlight = Instance.new("Highlight")
+selectionHighlight.Name = "SelectionHighlight"
+selectionHighlight.FillTransparency = 0.6
+selectionHighlight.OutlineColor = Color3.new(1, 1, 1)
+selectionHighlight.Parent = workshop
+
+local function highlightSelection(model, color)
+	selectionHighlight.Adornee = model
+	if model ~= nil and color ~= nil then
+		selectionHighlight.FillColor = color
+	end
+end
+
+local ghostFolder = Instance.new("Folder")
+ghostFolder.Name = "AssemblyGhosts"
+ghostFolder.Parent = Workspace
+
+-- Client-only copy used for prediction. It has no instance attributes, so server lookups never find it.
+local function makeGhost(model)
+	local ghost = model:Clone()
+	ghost.Name = "Ghost"
+	ghost:SetAttribute("InstanceId", nil)
+	ghost:SetAttribute("ComponentId", nil)
+	ghost:SetAttribute("SlotId", nil)
+	ghost:SetAttribute("Installed", nil)
+	for _, part in ipairs(ghost:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanQuery = false
+			part.CanTouch = false
+			part.CastShadow = false
+			part.Transparency = math.max(part.Transparency, 0.45)
+		end
+	end
+	local highlight = Instance.new("Highlight")
+	highlight.FillTransparency = 0.5
+	highlight.OutlineColor = Color3.new(1, 1, 1)
+	highlight.Adornee = ghost
+	highlight.Parent = ghost
+	ghost.Parent = ghostFolder
+	return ghost, highlight
+end
+
+-- The real part stays in place while it is held. Only the ghost moves.
+local function setRealHidden(model, hidden)
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.LocalTransparencyModifier = hidden and 1 or 0
+		end
+	end
+end
+
+-- ---------- scene helpers ----------
+
+local function modelFor(instanceId)
+	for _, child in ipairs(workshop:GetChildren()) do
+		if child:GetAttribute("InstanceId") == instanceId then
+			return child
+		end
+	end
+	return nil
+end
+
+local function instanceAt(screenPos)
+	local ray = Camera:ScreenPointToRay(screenPos.X, screenPos.Y)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { workshop }
+	local hit = Workspace:Raycast(ray.Origin, ray.Direction * 500, params)
+	if hit == nil then
+		return nil
+	end
+	local node = hit.Instance
+	while node ~= nil and node ~= workshop do
+		local id = node:GetAttribute("InstanceId")
+		if id ~= nil then
+			return id
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+local function pointOnPlane(screenPos, planeY)
+	local ray = Camera:ScreenPointToRay(screenPos.X, screenPos.Y)
+	local dy = ray.Direction.Y
+	if math.abs(dy) &lt; 0.001 then
+		return nil
+	end
+	local t = (planeY - ray.Origin.Y) / dy
+	if t &lt; 0 then
+		return nil
+	end
+	return ray.Origin + ray.Direction * t
+end
+
+local function listHas(list, value)
+	for _, item in ipairs(list) do
+		if item == value then
+			return true
+		end
+	end
+	return false
+end
+
+-- Local mirror of the server state, read from replicated attributes. It only predicts. The server re-checks.
+local function buildClientState()
+	local state = { caseId = workshop:GetAttribute("CaseId"), slots = {}, instances = {}, screws = {} }
+	for _, child in ipairs(workshop:GetChildren()) do
+		local slotId = child:GetAttribute("SlotId")
+		local instanceId = child:GetAttribute("InstanceId")
+		if slotId ~= nil and instanceId ~= nil then
+			state.slots[slotId] = instanceId
+			state.instances[instanceId] = { componentId = child:GetAttribute("ComponentId"), slotId = slotId }
+		end
+	end
+	return state
+end
+
+local function socketFor(slotId)
+	local slot = Catalog.Slots[slotId]
+	local owner = nil
+	if slot.ownerSlot == nil then
+		owner = workshop:FindFirstChild("Case")
+	else
+		for _, child in ipairs(workshop:GetChildren()) do
+			if child:GetAttribute("SlotId") == slot.ownerSlot then
+				owner = child
+				break
+			end
+		end
+	end
+	if owner == nil then
+		return nil
+	end
+	local socket = owner:FindFirstChild(slotId, true)
+	if socket and socket:IsA("BasePart") then
+		return socket
+	end
+	return nil
+end
+
+-- Install points that accept this product kind. Board points exist only after the motherboard is installed.
+local function socketCandidates(componentId)
+	local comp = Catalog.Components[componentId]
+	local list = {}
+	if comp == nil then
+		return list
+	end
+	for slotId, slot in pairs(Catalog.Slots) do
+		if listHas(slot.accepts, comp.kind) then
+			local socket = socketFor(slotId)
+			if socket ~= nil then
+				table.insert(list, {
+					slotId = slotId,
+					socketCF = socket.CFrame,
+					pose = PlacementRules.poseFromVectors(socket.CFrame.Position, socket.CFrame.UpVector, socket.CFrame.LookVector),
+				})
+			end
+		end
+	end
+	return list
+end
+
+-- Scene cache. Socket candidates and the state mirror are rebuilt only when something changed:
+-- a pickup, a server reply, a finished placement, or a cancelled drag. Not on every input event.
+local scene = { version = 0, state = nil, candidates = {} }
+
+local function bumpScene()
+	scene.version = scene.version + 1
+	scene.state = nil
+	scene.candidates = {}
+end
+
+local function currentState()
+	if scene.state == nil then
+		scene.state = buildClientState()
+	end
+	return scene.state
+end
+
+local function candidatesFor(componentId)
+	local list = scene.candidates[componentId]
+	if list == nil then
+		list = socketCandidates(componentId)
+		scene.candidates[componentId] = list
+	end
+	return list
+end
+
+-- Layout context for Decisions.free, in workshop coordinates. Same rules and data as the server's layoutFor.
+-- Returns nil for a part without layout data.
+local function freeLayout(h, cf)
+	local entry = WorkshopLayout.Components[h.componentId]
+	if entry == nil then
+		return nil
+	end
+	local origin = workshop:GetPivot()
+	local others = {}
+	for _, child in ipairs(workshop:GetChildren()) do
+		local otherId = child:GetAttribute("InstanceId")
+		local otherComponent = child:GetAttribute("ComponentId")
+		if otherId ~= nil and otherId ~= h.id and otherComponent ~= nil then
+			local otherEntry = WorkshopLayout.Components[otherComponent]
+			if otherEntry ~= nil then
+				table.insert(others, {
+					id = otherId,
+					componentId = otherComponent,
+					center = PlacementRules.point(origin:PointToObjectSpace(child:GetPivot().Position)),
+					size = otherEntry.size,
+				})
+			end
+		end
+	end
+	local caseBox = { center = PlacementRules.fromArray(WorkshopLayout.Case.center), size = WorkshopLayout.Case.size }
+	local tableBox = { center = PlacementRules.fromArray(WorkshopLayout.Table.center), size = WorkshopLayout.Table.size }
+	local candidate = {
+		id = h.id,
+		componentId = h.componentId,
+		center = PlacementRules.point(origin:PointToObjectSpace(cf.Position)),
+		size = entry.size,
+	}
+	return { candidate = candidate, others = others, caseBox = caseBox, surfaceY = WorkshopLayout.TableTopY, tableBox = tableBox }
+end
+
+-- Preview decision for the current drag pose. Returns { kind, slotId, socketCF, code, params }.
+-- It calls the same shared decisions as the server (Decisions), so a green preview means the server accepts the drop.
+local function evaluateDrop(h)
+	local free = h.freeCF
+	local posePt = PlacementRules.poseFromVectors(free.Position, free.UpVector, free.LookVector)
+	local benchPt = PlacementRules.point(workshop:GetPivot().Position)
+	local rootPart = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+	local rootPt = rootPart and PlacementRules.point(rootPart.Position) or nil
+	-- Snap: the nearest socket in range that passes the shared install decision. Taking only the nearest is not enough.
+	local chosen, snapOk, snapCode, snapParams = PlacementRules.chooseSnap(candidatesFor(h.componentId), posePt.pos, Config.SnapRadiusStuds, function(c)
+		return Decisions.install({
+			state = currentState(),
+			catalog = Catalog,
+			componentId = h.componentId,
+			instanceId = h.id,
+			slotId = c.slotId,
+			proposed = posePt,
+			socket = c.pose,
+			player = rootPt,
+			benchOrigin = benchPt,
+			benchHalf = BENCH_HALF,
+			maxReach = Config.MaxInteractDistance,
+			cfg = INSTALL_CFG,
+		})
+	end)
+	if chosen ~= nil then
+		if snapOk then
+			return { kind = "snap", slotId = chosen.slotId, socketCF = chosen.socketCF }
+		end
+		return { kind = "invalid", code = snapCode, params = snapParams or {} }
+	end
+	-- Free placement on the bench: the same shared decision the server runs.
+	local okFree, code, params = Decisions.free({
+		player = rootPt,
+		proposed = posePt,
+		benchOrigin = benchPt,
+		benchHalf = BENCH_HALF,
+		maxReach = Config.MaxInteractDistance,
+		layout = freeLayout(h, free),
+	})
+	if not okFree then
+		return { kind = "invalid", code = code, params = params or {} }
+	end
+	return { kind = "free" }
+end
+
+local function previewText(st)
+	if st.kind == "snap" then
+		return string.gsub(tr("ui.preview_snap"), "{slot}", Locale.slotLabel(lang, st.slotId))
+	elseif st.kind == "free" then
+		return tr("ui.preview_free")
+	end
+	local msg, hint = describeCode(st.code, st.params)
+	if hint ~= "" then
+		msg = msg .. " " .. hint
+	end
+	return msg
+end
+
+local function selectionText(model)
+	local componentId = model:GetAttribute("ComponentId")
+	return string.gsub(tr("ui.selected_part"), "{part}", Locale.partLine(lang, componentId, Catalog))
+end
+
+-- ---------- drag: one pointer at a time, requests in a fixed order ----------
+
+local pointer = PointerTracker.new()
+local held = nil          -- one drag: { id, componentId, model, ghost, highlight, colorKind, baseRot, yaw, planeY, point, freeCF, input, startPx, pickedAt, seq, lastEval, stateConn }
+local pending = {}        -- instanceId -&gt; { ghost, model, final, deadline }: placements the server has not confirmed yet
+local selectedId = nil
+
+local function bindDragSink()
+	ContextActionService:UnbindAction(DRAG_ACTION)
+	ContextActionService:BindActionAtPriority(DRAG_ACTION, function()
+		return Enum.ContextActionResult.Sink
+	end, false, Enum.ContextActionPriority.High.Value, Enum.UserInputType.Touch)
+end
+
+local function unbindDragSink()
+	ContextActionService:UnbindAction(DRAG_ACTION)
+end
+
+local function pointerKind(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		return "touch"
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseMovement then
+		return "mouse"
+	end
+	return nil
+end
+
+local function refreshDrag()
+	if held == nil then
+		return nil
+	end
+	held.freeCF = CFrame.new(held.point) * held.baseRot * CFrame.Angles(0, held.yaw, 0)
+	local st = evaluateDrop(held)
+	held.lastEval = st
+	local displayCF = held.freeCF
+	if st.kind == "snap" then
+		displayCF = st.socketCF
+	end
+	held.ghost:PivotTo(displayCF)
+	if held.colorKind ~= st.kind then
+		held.highlight.FillColor = GHOST_COLORS[st.kind] or GHOST_COLORS.invalid
+		held.colorKind = st.kind
+	end
+	lastLocalText = previewText(st)
+	show(lastLocalText)
+	return st
+end
+
+local function finishPending(id)
+	local p = pending[id]
+	if p == nil then
+		return
+	end
+	if p.ghost and p.ghost.Parent then
+		p.ghost:Destroy()
+	end
+	if p.model and p.model.Parent then
+		setRealHidden(p.model, false)
+	end
+	pending[id] = nil
+	bumpScene()
+end
+
+local function disconnectHoldInput(h)
+	if h.stateConn ~= nil then
+		h.stateConn:Disconnect()
+		h.stateConn = nil
+	end
+end
+
+-- Ends the local drag completely: pointer, camera sink, ghost, and real part visibility.
+local function cleanupHeld(h)
+	disconnectHoldInput(h)
+	unbindDragSink()
+	PointerTracker.finish(pointer)
+	if h.ghost and h.ghost.Parent then
+		h.ghost:Destroy()
+	end
+	if h.model and h.model.Parent then
+		setRealHidden(h.model, false)
+	end
+	if held == h then
+		held = nil
+	end
+	bumpScene()
+end
+
+-- Performs the actions DragSequence returns. Each one is a single request or a single local step.
+local function applyActions(h, actions)
+	for _, action in ipairs(actions) do
+		if action.type == "evaluate" then
+			local st = refreshDrag() or { kind = "invalid", code = "TOO_FAR", params = {} }
+			applyActions(h, DragSequence.resolve(h.seq, st))
+		elseif action.type == "propose" then
+			local poseCF = h.freeCF
+			if action.slotId ~= "" then
+				local snapCF = h.lastEval and h.lastEval.socketCF
+					if snapCF == nil then
+						cleanupHeld(h)
+						show(describeCode("NO_SOCKET", {}))
+						return
+					end
+					poseCF = snapCF
+			end
+			pending[h.id] = { ghost = h.ghost, model = h.model, final = nil, deadline = os.clock() + Config.PlacementTimeoutSec }
+			if held == h then
+				held = nil
+			end
+			Remote.ProposePlacement:FireServer(h.id, poseCF, action.slotId)
+			lastLocalText = tr("ui.sent")
+			show(lastLocalText)
+		elseif action.type == "tap" then
+			Remote.ReleaseHold:FireServer(h.id)
+			cleanupHeld(h)
+			highlightSelection(h.model, SELECT_COLOR)
+			lastLocalText = selectionText(h.model)
+			show(lastLocalText)
+		elseif action.type == "release" then
+			Remote.ReleaseHold:FireServer(h.id)
+			cleanupHeld(h)
+			if h.lastEval ~= nil then
+				lastLocalText = previewText(h.lastEval)
+				show(lastLocalText)
+			end
+		elseif action.type == "cancel" then
+			cleanupHeld(h)
+		end
+	end
+end
+
+-- The pointer lifted or the touch ended. Only the pointer that started the drag can do this.
+local function endPointer(input, kind)
+	if held == nil then
+		return
+	end
+	if not PointerTracker.acceptsEnd(pointer, input, kind) then
+		return
+	end
+	PointerTracker.finish(pointer)
+	local h = held
+	disconnectHoldInput(h)
+	unbindDragSink()
+	local actions = DragSequence.release(h.seq)
+	if h.seq.phase == "picking" then
+		lastLocalText = tr("ui.waitingPickup")
+		show(lastLocalText)
+	end
+	applyActions(h, actions)
+end
+
+-- The player's own way to end a drag. It is the same release as lifting the finger, and it works even if the
+-- platform never reports the end of the touch. Only needed as a safety net, but it keeps the drag from getting stuck.
+local function dropHeld()
+	local h = held
+	if h == nil then
+		lastLocalText = tr("ui.holdFirst")
+		show(lastLocalText)
+		return
+	end
+	if PointerTracker.isActive(pointer) then
+		PointerTracker.finish(pointer)
+	end
+	disconnectHoldInput(h)
+	unbindDragSink()
+	local actions = DragSequence.release(h.seq)
+	if h.seq.phase == "picking" then
+		lastLocalText = tr("ui.waitingPickup")
+		show(lastLocalText)
+	end
+	applyActions(h, actions)
+end
+
+-- Starts a drag for one part. Returns false when the part is still being placed. The caller then ends the pointer.
+local function beginHold(id, model, input, kind)
+	if pending[id] ~= nil then
+		lastLocalText = tr("ui.stillPending")
+		show(lastLocalText)
+		return false
+	end
+	local pivot = model:GetPivot()
+	local ghost, highlight = makeGhost(model)
+	held = {
+		id = id,
+		componentId = model:GetAttribute("ComponentId"),
+		model = model,
+		ghost = ghost,
+		highlight = highlight,
+		colorKind = nil,
+		baseRot = pivot - pivot.Position,
+		yaw = 0,
+		planeY = pivot.Position.Y,
+		point = pivot.Position,
+		freeCF = pivot,
+		input = input,
+		startPx = Vector2.new(input.Position.X, input.Position.Y),
+		pickedAt = os.clock(),
+		seq = DragSequence.new(id, Config.DragThresholdPixels),
+		lastEval = nil,
+		stateConn = nil,
+	}
+	if kind == "touch" then
+		-- The documented way to observe one touch: its InputObject changes to End when the finger lifts.
+		held.stateConn = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				endPointer(input, "touch")
+			end
+		end)
+		bindDragSink()
+	end
+	setRealHidden(model, true)
+	highlightSelection(nil)
+	bumpScene()
+	refreshDrag()
+	lastLocalText = tr("ui.waitingPickup")
+	show(lastLocalText)
+	Remote.PickUp:FireServer(id)
+	return true
+end
+
+local function rotateHeld(degrees)
+	if held == nil then
+		lastLocalText = tr("ui.holdFirst")
+		show(lastLocalText)
+		return
+	end
+	held.yaw = held.yaw + math.rad(degrees)
+	refreshDrag()
+end
+
+-- ---------- server replies ----------
+
+local function onPickupFeedback(payload)
+	local h = held
+	if h == nil or h.id ~= payload.instanceId then
+		return -- an answer about a part the player is no longer holding
+	end
+	if payload.ok then
+		applyActions(h, DragSequence.ack(h.seq, payload.instanceId, true))
+	else
+		applyActions(h, DragSequence.ack(h.seq, payload.instanceId, false))
+		lastPayload = payload
+		lastLocalText = nil
+		showPayload(payload)
+	end
+end
+
+local function onPlacementFeedback(payload)
+	local p = pending[payload.instanceId]
+	if p == nil then
+		return
+	end
+	if payload.ok then
+		p.final = payload.final
+		p.deadline = os.clock() + Config.PlacementTimeoutSec
+	else
+		finishPending(payload.instanceId)
+	end
+end
+
+Remote.Feedback.OnClientEvent:Connect(function(payload)
+	bumpScene()
+	if payload.kind == "pickup" then
+		onPickupFeedback(payload)
+		return
+	end
+	lastPayload = payload
+	lastLocalText = nil
+	if payload.kind == "placement" then
+		onPlacementFeedback(payload)
+	end
+	showPayload(payload)
+	if payload.kind == "boot" and not payload.ok and (payload.code == "BOOT_FAILED" or payload.code == "ORDER_NOT_MET") then
+		openDiagnostics(payload.diagnostics)
+	end
+	refreshLabels()
+end)
+
+-- ---------- timers: pickup timeout, placement confirmation, lost parts ----------
+
+RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	local h = held
+	if h ~= nil then
+		if h.model.Parent == nil then
+			cleanupHeld(h)
+			lastLocalText = tr("ui.gone")
+			show(lastLocalText)
+		elseif h.seq.phase == "picking" and now - h.pickedAt &gt; Config.PickupTimeoutSec then
+			applyActions(h, DragSequence.timeout(h.seq))
+			lastLocalText = tr("ui.pickupTimeout")
+			show(lastLocalText)
+		end
+	end
+	for id, p in pairs(pending) do
+		local done = false
+		if p.final ~= nil and p.model.Parent ~= nil then
+			local pivot = p.model:GetPivot()
+			if (pivot.Position - p.final.Position).Magnitude &lt; Config.ConfirmDistanceStuds then
+				done = true
+			end
+		end
+		if done or now &gt; p.deadline then
+			finishPending(id)
+		end
+	end
+end)
+
+-- ---------- input (touch and mouse) ----------
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	local isPress = input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1
+	if isPress then
+		if held ~= nil then
+			return -- a second finger or a second press does not start another drag
+		end
+		local kind = pointerKind(input)
+		if not PointerTracker.begin(pointer, input, kind) then
+			return
+		end
+		local id = instanceAt(Vector2.new(input.Position.X, input.Position.Y))
+		if id == nil then
+			PointerTracker.finish(pointer)
+			selectedId = nil
+			highlightSelection(nil)
+			return
+		end
+		local model = modelFor(id)
+		if model == nil then
+			PointerTracker.finish(pointer)
+			return
+		end
+		selectedId = id
+		highlightSelection(model, SELECT_COLOR)
+		if model:GetAttribute("Installed") then
+			PointerTracker.finish(pointer)
+			lastLocalText = selectionText(model) .. "\n" .. tr("ui.installedHint")
+			show(lastLocalText)
+			return
+		end
+		if not beginHold(id, model, input, kind) then
+			PointerTracker.finish(pointer)
+		end
+	elseif input.KeyCode == Enum.KeyCode.Q then
+		rotateHeld(-15)
+	elseif input.KeyCode == Enum.KeyCode.E then
+		rotateHeld(15)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if held == nil then
+		return
+	end
+	local kind = pointerKind(input)
+	if kind == nil or not PointerTracker.acceptsMove(pointer, input, kind) then
+		return
+	end
+	local px = Vector2.new(input.Position.X, input.Position.Y)
+	DragSequence.pointerMoved(held.seq, (px - held.startPx).Magnitude)
+	local point = pointOnPlane(px, held.planeY)
+	if point == nil then
+		return
+	end
+	held.point = Vector3.new(point.X, held.planeY, point.Z)
+	refreshDrag()
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if held == nil then
+		return
+	end
+	local kind = pointerKind(input)
+	if kind == nil then
+		return
+	end
+	endPointer(input, kind)
+end)
+
+-- ---------- camera ----------
+
+local closeUp = false
+local function toggleCamera()
+	closeUp = not closeUp
+	if closeUp then
+		local focus = workshop:GetPivot().Position
+		local case = workshop:FindFirstChild("Case")
+		if case ~= nil and case:IsA("Model") then
+			focus = case:GetPivot().Position
+		end
+		Camera.CameraType = Enum.CameraType.Scriptable
+		Camera.CFrame = CFrame.lookAt(focus + Vector3.new(0, 7, 10), focus)
+	else
+		Camera.CameraType = Enum.CameraType.Custom
+	end
+end
+
+-- ---------- buttons and language ----------
+
+addButton("ui.camera", toggleCamera)
+addButton("ui.rotL", function()
+	rotateHeld(-15)
+end)
+addButton("ui.rotR", function()
+	rotateHeld(15)
+end)
+addButton("ui.drop", dropHeld)
+addButton("ui.screw", function()
+	if selectedId == nil then
+		lastLocalText = tr("ui.selectFirst")
+		show(lastLocalText)
+		return
+	end
+	Remote.TightenScrew:FireServer(selectedId)
+end)
+addButton("ui.remove", function()
+	if selectedId == nil then
+		lastLocalText = tr("ui.selectInstalled")
+		show(lastLocalText)
+		return
+	end
+	Remote.RequestUninstall:FireServer(selectedId)
+end)
+addButton("ui.boot", function()
+	Remote.RequestBoot:FireServer()
+end)
+
+langButton.Activated:Connect(function()
+	lang = (lang == "ar") and "en" or "ar"
+	applyLanguage()
+end)
+
+workshop:GetAttributeChangedSignal("Wallet"):Connect(refreshLabels)
+workshop:GetAttributeChangedSignal("OrderDone"):Connect(refreshLabels)
+
+applyLanguage()
+</ProtectedString>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerStorage" referent="RBX150ED4117E3E4DC7">
+    <Properties>
+      <string name="Name">ServerStorage</string>
+    </Properties>
+  </Item>
+  <Item class="Lighting" referent="RBX87456B800EAB43F0">
+    <Properties>
+      <string name="Name">Lighting</string>
+    </Properties>
+  </Item>
+</roblox>
