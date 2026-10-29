@@ -1487,6 +1487,50 @@ return L
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
+    <Item class="Script" referent="RBXPCBUILDER_SAFESPAWN_R5">
+      <Properties>
+        <string name="Name">PCBuilderSafeSpawn</string>
+        <ProtectedString name="Source">-- PCBuilderSafeSpawn.server.lua
+-- Fallback spawn area for the prototype. The workshop system moves players to their
+-- own workshop after it has been created. This pad keeps the initial spawn safe if
+-- the workshop setup fails or takes longer than expected.
+local Workspace = game:GetService("Workspace")
+
+local PAD_NAME = "PCBuilderSafeSpawnPad"
+local SPAWN_NAME = "PCBuilderSafeSpawnLocation"
+
+local pad = Workspace:FindFirstChild(PAD_NAME)
+if pad == nil then
+	pad = Instance.new("Part")
+	pad.Name = PAD_NAME
+	pad.Size = Vector3.new(40, 1, 40)
+	pad.CFrame = CFrame.new(0, -0.5, 0)
+	pad.Anchored = true
+	pad.CanCollide = true
+	pad.CanTouch = true
+	pad.Material = Enum.Material.Concrete
+	pad.Color = Color3.fromRGB(66, 68, 76)
+	pad.TopSurface = Enum.SurfaceType.Smooth
+	pad.BottomSurface = Enum.SurfaceType.Smooth
+	pad.Parent = Workspace
+end
+
+local spawn = Workspace:FindFirstChild(SPAWN_NAME)
+if spawn == nil then
+	spawn = Instance.new("SpawnLocation")
+	spawn.Name = SPAWN_NAME
+	spawn.Size = Vector3.new(6, 1, 6)
+	spawn.CFrame = CFrame.new(0, 0.5, 0)
+	spawn.Anchored = true
+	spawn.CanCollide = true
+	spawn.Neutral = true
+	spawn.Duration = 0
+	spawn.Transparency = 1
+	spawn.Parent = Workspace
+end
+</ProtectedString>
+      </Properties>
+    </Item>
     <Item class="Script" referent="RBXBFF50400A6DA4F68">
       <Properties>
         <string name="Name">AssemblyServer</string>
@@ -2065,12 +2109,41 @@ end
 -- ---------- players ----------
 
 local function onPlayerAdded(player)
-	createSession(player)
-	player.CharacterAdded:Connect(function()
-		placeCharacter(player)
+	-- Connect FIRST. If CharacterAdded fires while the workshop is being built,
+	-- the callback waits for the session instead of losing the initial spawn.
+	player.CharacterAdded:Connect(function(character)
+		task.spawn(function()
+			local root = character:WaitForChild("HumanoidRootPart", 10)
+			if root == nil then
+				return
+			end
+			-- Session creation may still be in progress. Wait up to five seconds.
+			for _ = 1, 50 do
+				if sessions[player] ~= nil then
+					break
+				end
+				if player.Parent == nil then
+					return
+				end
+				task.wait(0.1)
+			end
+			if sessions[player] ~= nil and player.Character == character then
+				placeCharacter(player)
+			end
+		end)
 	end)
-	if player.Character ~= nil then
-		placeCharacter(player)
+
+	createSession(player)
+
+	-- Also handle a character that already exists before PlayerAdded is processed.
+	local character = player.Character
+	if character ~= nil then
+		task.spawn(function()
+			local root = character:WaitForChild("HumanoidRootPart", 10)
+			if root ~= nil and player.Character == character then
+				placeCharacter(player)
+			end
+		end)
 	end
 end
 
