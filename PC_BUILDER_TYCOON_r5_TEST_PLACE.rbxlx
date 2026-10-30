@@ -1503,7 +1503,7 @@ local pad = Workspace:FindFirstChild(PAD_NAME)
 if pad == nil then
 	pad = Instance.new("Part")
 	pad.Name = PAD_NAME
-	pad.Size = Vector3.new(40, 1, 40)
+	pad.Size = Vector3.new(500, 1, 500)
 	pad.CFrame = CFrame.new(0, -0.5, 0)
 	pad.Anchored = true
 	pad.CanCollide = true
